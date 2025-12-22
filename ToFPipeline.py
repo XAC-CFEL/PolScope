@@ -8,6 +8,8 @@ from functools import partial
 
 from pathlib import Path
 import string, os, re
+import h5py
+import dask.array as da
 
 import time
 from tqdm.notebook import tqdm
@@ -152,9 +154,7 @@ class FLASHLoader(Loader):
             [g.isel(pulse=slice(trainStart, trainStop)) for _, g in grouped],
             dim="pulse")
         self.data = sliced
-        return self
-        
-
+        return self      
 class EuXFelLoader(Loader):
     def __init__(self,proposal, runNo,config=None):
         super().__init__(config)
@@ -297,7 +297,256 @@ class EuXFelLoader(Loader):
             self.xgm = self.xgm.assign_coords(pulseId = pulseIds).stack(pulse=('trainId','pulseId'))
         """
         return self
-
+class NXSLoader(Loader):
+    """
+    Loader for .nxs files containing time-of-flight histogram data.
+    
+    Each .nxs file represents a single run with histogram data from 15 channels.
+    The data is transformed into an xarray.DataArray with dimensions:
+    - detector: Channel numbers (0-14)
+    - pulse: Measurement points per run  
+    - sample: Time-of-flight bins
+    """
+    
+    def __init__(self, dataPath, runNumbers=None, config=None):
+        super().__init__(config)
+        self.dataPath = Path(dataPath)
+        self.runNumbers = runNumbers or []
+        self.data = None
+        self._filePattern = self.config.get("filePattern", "*_{run_number:05d}.nxs")
+        
+        # Set up detector angles if provided in config
+        fullTheta = np.array(self.config.get("angles", np.linspace(0, 360, 16, endpoint=False)))
+        detectors = self.config.get("ToF",[1])
+        theta = fullTheta[detectors]
+        self.angles = pd.DataFrame(detectors, columns=["detector"])
+        self.angles["Angles"] = theta
+    
+    def _getFilePath(self, runNumber):
+        """Get file path for a given run number."""
+        pattern = self._filePattern.format(run_number=runNumber)
+        files = list(self.dataPath.glob(pattern))
+        if not files:
+            # Try alternative patterns
+            altPatterns = [
+                f"*{runNumber:05d}.nxs",
+                f"*_{runNumber:05d}.nxs", 
+                f"*{runNumber}.nxs"
+            ]
+            for altPattern in altPatterns:
+                files = list(self.dataPath.glob(altPattern))
+                if files:
+                    break
+        if not files:
+            raise FileNotFoundError(f"No .nxs file found for run {runNumber}")
+        return files[0]
+    
+    def _extractRunNumber(self, filePath):
+        """Extract run number from filename."""
+        match = re.search(r'_(\d+)\.nxs$', str(filePath))
+        return int(match.group(1)) if match else None
+    
+    def _loadSingleFile(self, filePath, roi=None):
+        """Load data from a single .nxs file."""
+        with h5py.File(filePath, 'r') as f:
+            runNumber = self._extractRunNumber(filePath)
+            if runNumber is None:
+                raise ValueError(f"Could not extract run number from {filePath}")
+            
+            # Get data from all histogram channels
+            channelsData = []
+            nDetectors = 15  # ch01 to ch15
+            
+            for chIdx in range(1, nDetectors + 1):
+                chName = f'histogram_ch{chIdx:02d}'
+                if f'scan/instrument/{chName}/data' in f:
+                    # Shape is (n_pulses, n_samples)
+                    chData = f[f'scan/instrument/{chName}/data'][:]
+                    # Apply ROI if specified
+                    if roi is not None:
+                        chData = chData[:, roi[0]:roi[1]]
+                    channelsData.append(chData)
+                else:
+                    # Handle missing channels by creating zeros
+                    print(f"Warning: {chName} not found in {filePath}")
+                    if channelsData:
+                        chData = np.zeros_like(channelsData[0])
+                    else:
+                        # Apply ROI to default shape if specified
+                        if roi is not None:
+                            defaultShape = (2, roi[1] - roi[0])
+                        else:
+                            defaultShape = (2, 1920)  # Default shape based on observed data
+                        chData = np.zeros(defaultShape)
+                    channelsData.append(chData)
+            
+            # Stack channel data: (n_detectors, n_pulses, n_samples)  
+            dataArray = np.stack(channelsData, axis=0)
+            
+            # Get time-of-flight axis - use first available channel
+            for chIdx in range(1, nDetectors + 1):
+                chName = f'histogram_ch{chIdx:02d}'
+                if f'scan/instrument/{chName}/time_of_flight' in f:
+                    tofAxis = f[f'scan/instrument/{chName}/time_of_flight'][:]
+                    # Apply ROI to tof axis if specified
+                    if roi is not None:
+                        tofAxis = tofAxis[roi[0]:roi[1]]
+                    break
+            else:
+                # Fallback: create default ToF axis
+                nSamples = dataArray.shape[2]
+                tofAxis = np.linspace(0, nSamples * 0.1, nSamples)
+                # If ROI was applied, adjust the start of the axis
+                if roi is not None:
+                    tofAxis = tofAxis + (roi[0] * 0.1)
+            
+            # Get timestamps
+            timestamps = f['scan/instrument/collection/timestamp'][:]
+            nPulses = dataArray.shape[1]
+            
+            return {
+                'data': dataArray,
+                'runNumber': runNumber, 
+                'tofAxis': tofAxis,
+                'timestamps': timestamps,
+                'nPulses': nPulses,
+                'roi': roi  # Store ROI for coordinate creation
+            }
+    
+    def load(self, runNumbers=None, roi=None):
+        """
+        Load data from .nxs files.
+        
+        Parameters
+        ----------
+        runNumbers : list, optional
+            List of run numbers to load. If None, uses self.runNumbers.
+        roi : tuple or list, optional
+            Region of interest for sample axis as [start, end]. If None, loads all samples.
+            Original sample indices are preserved in coordinates.
+            
+        Returns
+        -------
+        self : NXSLoader
+            Returns self with loaded data in self.data
+        """
+        runNumbers = runNumbers or self.runNumbers
+        if not runNumbers:
+            # Auto-detect run numbers from files
+            nxsFiles = list(self.dataPath.glob("*.nxs"))
+            runNumbers = []
+            for filePath in nxsFiles:
+                runNum = self._extractRunNumber(filePath)
+                if runNum is not None:
+                    runNumbers.append(runNum)
+            runNumbers = sorted(runNumbers)
+            print(f"Auto-detected {len(runNumbers)} runs: {runNumbers[:5]}{'...' if len(runNumbers) > 5 else ''}")
+        
+        allData = []
+        allCoords = {
+            'daq_run': [],
+            'trainId': [],
+            'pulseId': []
+        }
+        
+        for runNum in runNumbers:
+            try:
+                filePath = self._getFilePath(runNum) 
+                fileData = self._loadSingleFile(filePath, roi=roi)
+                
+                data = fileData['data']
+                nPulses = fileData['nPulses']
+                
+                # Create pulse coordinates for this run
+                # Each pulse gets a unique trainId and pulseId 
+                trainIds = np.full(nPulses, runNum, dtype=np.uint32)
+                pulseIds = np.arange(nPulses, dtype=np.int64)
+                daqRuns = np.full(nPulses, runNum, dtype=np.uint32)
+                
+                allData.append(data)
+                allCoords['daq_run'].extend(daqRuns)
+                allCoords['trainId'].extend(trainIds)
+                allCoords['pulseId'].extend(pulseIds)
+                
+            except Exception as e:
+                print(f"Error loading run {runNum}: {e}")
+                continue
+        
+        if not allData:
+            raise ValueError("No data could be loaded")
+        
+        # Concatenate all data along pulse dimension
+        fullData = np.concatenate(allData, axis=1)
+        
+        # Create dask array with appropriate chunking
+        chunkSize = (1, min(len(allCoords['trainId']), 21175), fullData.shape[2])
+        daskData = da.from_array(fullData, chunks=chunkSize)
+        
+        # Get sample axis from first loaded file
+        filePath = self._getFilePath(runNumbers[0])
+        sampleData = self._loadSingleFile(filePath, roi=roi)
+        nSamples = len(sampleData['tofAxis'])
+        
+        # Create coordinates - maintain original sample indices if ROI was used
+        detectorCoords = np.arange(fullData.shape[0], dtype=np.int64)
+        if roi is not None:
+            # Preserve original sample indices
+            sampleCoords = np.arange(roi[0], roi[1], dtype=np.int64)
+        else:
+            sampleCoords = np.arange(nSamples, dtype=np.int64)
+        
+        # Create MultiIndex for pulse coordinate
+        pulseTuples = list(zip(allCoords['trainId'], allCoords['pulseId']))
+        pulseIndex = pd.MultiIndex.from_tuples(
+            pulseTuples, 
+            names=['trainId', 'pulseId']
+        )
+        
+        # Create xarray DataArray
+        self.data = xr.DataArray(
+            daskData,
+            dims=['detector', 'pulse', 'sample'],
+            coords={
+                'detector': ('detector', detectorCoords),
+                'pulse': ('pulse', pulseIndex),
+                'sample': ('sample', sampleCoords),
+                'daq_run': ('pulse', allCoords['daq_run'])
+            },
+            name='adc00'
+        )
+        
+        return self
+    
+    def defaultPreprocessing(self, ToF=None, baselineRegion=None, trainStart=None, trainStop=None):
+        """
+        Apply default preprocessing similar to other loaders.
+        """
+        ToF = ToF or self.config.get("ToF", [0])
+        self.data = self.data.sel(detector=ToF)
+        
+        if baselineRegion is not None:
+            baselineRegion = baselineRegion
+        else:
+            baselineRegion = self.config.get("baselineRegion", [0, 10])
+        
+        # Apply baseline correction
+        if baselineRegion[1] is None:
+            baselineSlice = slice(baselineRegion[0], None)
+        else:
+            baselineSlice = slice(baselineRegion[0], baselineRegion[1])
+            
+        self.data = (self.data - self.data.isel(sample=baselineSlice).mean(dim="sample"))
+        
+        # Apply train slicing if specified
+        if trainStart is not None or trainStop is not None:
+            grouped = self.data.groupby("daq_run")
+            sliced = xr.concat(
+                [g.isel(pulse=slice(trainStart, trainStop)) for _, g in grouped],
+                dim="pulse"
+            )
+            self.data = sliced
+            
+        return self
 class PeakFinder(Configurable):
     def __init__(self, data, config=None):
         super().__init__(config)
@@ -347,7 +596,8 @@ class PeakFinder(Configurable):
                 chunkTrainIds = [int(chunkTrainIds)]*len(chunkPulseIds)
                 chunk = chunk.rename({"trainId": "tid", "pulseId": "pulse"})
                 multi_idx = pd.MultiIndex.from_arrays([chunkTrainIds, chunkPulseIds],names=["trainId", "pulseId"])
-                chunk = chunk.assign_coords(pulse=multi_idx).drop_vars("tid").squeeze("tid") 
+                mindex_coords = xr.Coordinates.from_pandas_multiindex(multi_idx, 'pulse')
+                chunk = chunk.assign_coords(mindex_coords).drop_vars("tid").squeeze("tid") 
                 chunks.append(chunk)
                 
             stack = xr.concat(chunks,dim="pulse")
@@ -373,7 +623,8 @@ class PeakFinder(Configurable):
                 chunkPulseIds = [int(chunkPulseIds)]*len(chunkTrainIds)
                 chunk = chunk.rename({"trainId": "pulse", "pulseId": "pid"})
                 multi_idx = pd.MultiIndex.from_arrays([chunkTrainIds, chunkPulseIds],names=["trainId", "pulseId"])
-                chunk = chunk.assign_coords(pulse=multi_idx).drop_vars("pid").squeeze("pid")  
+                mindex_coords = xr.Coordinates.from_pandas_multiindex(multi_idx, 'pulse')
+                chunk = chunk.assign_coords(mindex_coords).drop_vars("pid").squeeze("pid")  
                 chunks.append(chunk)
     
             stack = xr.concat(chunks,dim="pulse")
@@ -383,9 +634,36 @@ class PeakFinder(Configurable):
 
     def normalize(self,ToF=None):
         if ToF != None:
-            self.data = self.data / self.data.sel(detector=ToF).max().commpute()
+            self.data = self.data / self.data.sel(detector=ToF).max().compute()
         else:
             self.data = self.data/self.data.max().compute()
+        self.data = self.data.persist()
+        return self
+
+    def smooth(self, windowSize=None):
+        """
+        Apply smoothing to the data using a rolling average.
+        
+        Parameters
+        ----------
+        windowSize : int, optional
+            Size of the rolling window for smoothing. If None, uses config value or defaults to 5.
+            
+        Returns
+        -------
+        self : PeakFinder
+            Returns self for method chaining
+        """
+        windowSize = windowSize if windowSize is not None else self.config.get("smoothWindow", 5)
+        
+        # Apply rolling mean along the sample dimension
+        smoothed = self.data.rolling(sample=windowSize, center=True).mean()
+        
+        # Trim edges to avoid NaN values - start after windowSize//2 and stop before windowSize//2
+        half_window = windowSize // 2
+        sample_slice = slice(half_window, -half_window if half_window > 0 else None)
+        self.data = smoothed.isel(sample=sample_slice)
+        
         self.data = self.data.persist()
         return self
 
@@ -531,11 +809,6 @@ class PeakFinder(Configurable):
     
         self.results = df
         return self
-
-
-
-
-
 class AuxFunc:
     def __init__(self, data):
         self.data = data
@@ -554,7 +827,6 @@ def streamXarray(data):
     for trainId, group in data.groupby("trainId"):
         #time.sleep(0.01)
         yield group
-
 
 class PhotonEnergyProcessor(Configurable):
     def __init__(self, proposal, runNo, loaderClass, config=None):
@@ -630,6 +902,7 @@ class Calibrate(Configurable):
         self.energyParam = []
         self.transmissionParam = []
 
+
     def madFilter(self, x, y, thresh=3):
         y_np = np.asarray(y)
         med = np.median(y_np)
@@ -680,7 +953,7 @@ class Calibrate(Configurable):
         self.energyParam = pd.DataFrame(energyParam)
         return self
 
-    def transmission(self, peakNo=None, setBeta=None, setPhi=None, setPlin=None):
+    def transmission(self, peakNo=None, setBeta=None, setPhi=None, setPlin=None,intMethod="fwhm area"):
         transmissionParam = []
         """
         beta = beta or self.config.get("beta",0)
@@ -689,12 +962,11 @@ class Calibrate(Configurable):
         for energy in self.data["Photon Energy"].unique():
             for ToF in self.data["detector"].unique():
                 selData = self.data[(self.data["peakNo"]==peakNo)&(self.data["Photon Energy"]==energy)&(self.data["detector"]==ToF)]
-                trace = selData["fwhm area"].values
-                theta = np.deg2rad(selData["Angles"].to_numpy()[0])
-                
+                trace = selData[intMethod].mean()
+                theta = np.deg2rad(selData["Angles"].to_numpy())
                 g = polarization_model(theta, Plin=setPlin, phi=setPhi,beta2=setBeta)
-                transPar = trace/g
-                transmissionParam.append({"detector": ToF, "Photon Energy": energy, "Transmission coefficent": transPar[0]})
+                transPar = g/trace
+                transmissionParam.append({"detector": ToF, "Photon Energy": energy, "Transmission coefficent": transPar})
         self.transmissionParam = pd.DataFrame(transmissionParam)
         return self
 
@@ -755,7 +1027,7 @@ class Calibrate(Configurable):
         plt.show()
         return self
 
-class plotter(Configurable):
+class Plotter(Configurable):
     def __init__(self, results, config=None):
         super().__init__(config)
         self.results = results
@@ -765,38 +1037,38 @@ class plotter(Configurable):
         
         fig, ax = plt.subplots(figsize=(6,4), subplot_kw={'projection': 'polar'})
         fullTheta = np.linspace(0,2*np.pi,16,endpoint=False)
-        area = self.results[self.results["peakNo"]==peakNo][["fwhm area","detector","Angles"]]
+        area = self.results[self.results["peakNo"]==peakNo][["fwhm area","height","detector","Angles"]]
         calib = transParam
         calibArea = pd.merge(area,calib,on="detector")
         calibArea["calibValue"] = calibArea[intMethod] * calibArea["Transmission coefficent"] / calibArea[intMethod].max()
             
         theta = calibArea["Angles"].values*np.pi/180
-        trace = calibArea["calibValue"].values
-        #ax.set_rlim(0,2)
+        trace = calibArea["calibValue"]
+        maxTrace = max(trace)[0]
         ax.plot(theta, trace, marker="o", linewidth=0, label='Data')
     
         def model(theta,Plin,phi,scale):
             return polarization_model(theta, Plin, phi, beta2=beta, scale=scale)
             
-        initial_guess = [0.5, 0.0,1.0]  # [Plin, phi, scale]
-        bounds = ([0, -np.pi,0], [2, np.pi,20])
+        initial_guess = [0, 0.0,1.0]  # [Plin, phi, scale]
+        bounds = ([0, -np.pi,0], [2, np.pi,1])
         popt, pcov = curve_fit(model, theta, trace, p0=initial_guess, bounds=bounds)
         Plin_fit, phi_fit, scale_fit = popt
     
         theta_fit = np.linspace(0, 2*np.pi, 360)
         intensity_fit = model(theta_fit, Plin_fit, phi_fit, scale=scale_fit)
-        
-        #ax.set_rlim(0,1.2)
+
         if Plin_fit>0.015:
-            ax.plot([phi_fit,phi_fit],[0,1],color="orange")
-            ax.plot([phi_fit+np.pi,phi_fit+np.pi],[0,1],color="orange")
+            ax.plot([phi_fit,phi_fit],[0,maxTrace],color="orange")
+            ax.plot([phi_fit+np.pi,phi_fit+np.pi],[0,maxTrace],color="orange")
         ax.plot(theta_fit, intensity_fit, label=f"Fitted degree of linear polarization: {Plin_fit:.5f}",color="green")
             
         ax.set_yticks([])
-        ax.set_theta_zero_location("N")  # 0° at top
-        ax.set_theta_direction(-1)       # clockwise
+        ax.set_theta_zero_location("E")  # 0° at top
+        ax.set_theta_direction(1)       # clockwise
         ax.legend(loc="lower right")
         plt.show()
+        return popt,pcov
 
 class StreamTracePlotter:
     def __init__(self):
@@ -1001,7 +1273,7 @@ def findAsymmetricPeakWidth(trace,peak):
                 break          
     return peakWidthL, peakWidthR
 
-def findPeak(trace, widthFactor=2, symmetric = True):
+def findPeak(trace, widthFactor=2, symmetric = False):
     '''
     Function to find the minimum in a trace.
 
@@ -1075,8 +1347,9 @@ def findPeak_np(trace, widthFactor=2, symmetric=False, maxWidth=20, minWidth=Fal
     start_zero = max(0, peak + widthL*widthFactor)
     stop_zero = min(len(trace), peak + widthR*widthFactor)
     if minWidth:
-        widthL = -min(abs(widthL),abs(widthR))
-        widthR = min(abs(widthL),abs(widthR))
+        min_width = min(abs(widthL), abs(widthR))
+        widthL, widthR = -min_width, min_width
+
     # Area under peak
     start = max(0, peak + widthL)
     stop = min(len(trace), peak + widthR)
@@ -1101,7 +1374,8 @@ def findPeaksInTrace_np(trace, peakNo, cutOff=-100, widthFactor=2, symmetric=Tru
         results_arr = np.array(results, dtype=float)
         sorted_indices = np.argsort(results_arr[:, 0])  # sort by pos
         return results_arr[sorted_indices]
-
+    
+    return None  # Explicitly return None if no peaks found
 
 def findPeaksInTrace_sp(trace, peakNo, cutOff=0, widthFactor=2, symmetric=False, maxWidth=20):
     results = []
@@ -1134,8 +1408,6 @@ def findPeaksInTrace_sp(trace, peakNo, cutOff=0, widthFactor=2, symmetric=False,
         results_arr = np.array(results, dtype=float)
         sorted_indices = np.argsort(results_arr[:, 0])  # sort by pos
         return results_arr[sorted_indices]
-
-
 
 def negExpFunc(x, a, b, c):
     return a * np.exp(-b * x) + c
