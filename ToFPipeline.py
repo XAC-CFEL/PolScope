@@ -1027,47 +1027,58 @@ class Calibrate(Configurable):
         plt.show()
         return self
 
-class Plotter(Configurable):
+class Fitter(Configurable):
     def __init__(self, results, config=None):
         super().__init__(config)
         self.results = results
 
-    def plotPol(self, transParam, peakNo=None,beta=0,intMethod="fwhm area"):
+    def Pol(self, transParam, peakNo=None,beta=0,intMethod="fwhm area",plot=True):
         peakNo = peakNo if peakNo is not None else self.config.get("peakNo", 0)
         
-        fig, ax = plt.subplots(figsize=(6,4), subplot_kw={'projection': 'polar'})
         fullTheta = np.linspace(0,2*np.pi,16,endpoint=False)
         area = self.results[self.results["peakNo"]==peakNo][["fwhm area","height","detector","Angles"]]
         calib = transParam
         calibArea = pd.merge(area,calib,on="detector")
-        calibArea["calibValue"] = calibArea[intMethod] * calibArea["Transmission coefficent"] / calibArea[intMethod].max()
+        calibArea["calibValue"] = calibArea[intMethod] * calibArea["Transmission coefficent"] #/ max(calibArea[intMethod])
             
         theta = calibArea["Angles"].values*np.pi/180
         trace = calibArea["calibValue"]
         maxTrace = max(trace)[0]
-        ax.plot(theta, trace, marker="o", linewidth=0, label='Data')
+        
     
         def model(theta,Plin,phi,scale):
-            return polarization_model(theta, Plin, phi, beta2=beta, scale=scale)
+            return polarization_model(theta, Plin=Plin, phi=phi, beta2=beta, scale=scale)
             
-        initial_guess = [0, 0.0,1.0]  # [Plin, phi, scale]
-        bounds = ([0, -np.pi,0], [2, np.pi,1])
-        popt, pcov = curve_fit(model, theta, trace, p0=initial_guess, bounds=bounds)
+        initial_guess = [0.2, 0.0,1.0]  # [Plin, phi, scale]
+        bounds = ([0.0, -np.pi,0], [2, np.pi,2])
+        
+        # More precise fitting parameters for small values
+        popt, pcov = curve_fit(model, theta, trace, p0=initial_guess, bounds=bounds,
+                                method='trf',
+                              ftol=1e-12,    # relative error in sum of squares
+                              xtol=1e-12,    # relative error in solution
+                              gtol=1e-12,    # orthogonality desired
+                              maxfev=10000)  # maximum function evaluations
         Plin_fit, phi_fit, scale_fit = popt
     
         theta_fit = np.linspace(0, 2*np.pi, 360)
-        intensity_fit = model(theta_fit, Plin_fit, phi_fit, scale=scale_fit)
-
-        if Plin_fit>0.015:
-            ax.plot([phi_fit,phi_fit],[0,maxTrace],color="orange")
-            ax.plot([phi_fit+np.pi,phi_fit+np.pi],[0,maxTrace],color="orange")
-        ax.plot(theta_fit, intensity_fit, label=f"Fitted degree of linear polarization: {Plin_fit:.5f}",color="green")
-            
-        ax.set_yticks([])
-        ax.set_theta_zero_location("E")  # 0° at top
-        ax.set_theta_direction(1)       # clockwise
-        ax.legend(loc="lower right")
-        plt.show()
+        Plin_fit = np.round(Plin_fit, 8)
+        scale_fit = np.round(scale_fit, 8)
+        phi_fit = np.round(phi_fit, 8)
+        intensity_fit = polarization_model(theta_fit, Plin=Plin_fit, phi=phi_fit, beta2=beta, scale=scale_fit)
+        if plot:
+            fig, ax = plt.subplots(figsize=(6,4), subplot_kw={'projection': 'polar'})
+            ax.plot(theta, trace, marker="o", linewidth=0, label='Data')
+            if Plin_fit>0.015:
+                ax.plot([phi_fit,phi_fit],[0,maxTrace],color="orange")
+                ax.plot([phi_fit+np.pi,phi_fit+np.pi],[0,maxTrace],color="orange")
+            ax.plot(theta_fit, intensity_fit, label=f"Fitted degree of linear polarization: {Plin_fit:.5f}",color="green")
+                
+            ax.set_yticks([])
+            ax.set_theta_zero_location("E")  # 0° at top
+            ax.set_theta_direction(1)       # clockwise
+            ax.legend(loc="lower right")
+            plt.show()
         return popt,pcov
 
 class StreamTracePlotter:
