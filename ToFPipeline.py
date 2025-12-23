@@ -1032,7 +1032,7 @@ class Fitter(Configurable):
         super().__init__(config)
         self.results = results
 
-    def Pol(self, transParam, peakNo=None,beta=0,intMethod="fwhm area",plot=True):
+    def pol(self, transParam, peakNo=None,beta=0,intMethod="fwhm area",plot=True):
         peakNo = peakNo if peakNo is not None else self.config.get("peakNo", 0)
         
         fullTheta = np.linspace(0,2*np.pi,16,endpoint=False)
