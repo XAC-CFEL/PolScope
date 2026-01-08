@@ -54,7 +54,7 @@ class Configurable:
 
 class Loader(Configurable):
     def load(self):
-        raise NotImplemtedError
+        raise NotImplementedError
         
 _RUN_CACHE = {}
 class FLASHLoader(Loader):
