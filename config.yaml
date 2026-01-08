@@ -15,6 +15,8 @@ PeakFinder:
   symmetric: False
   threshold: 0.2
   peakNo: 1
+  stackTrains: True
+  stackPulses: True
   trainStackSize: null
   pulseStackStart: null
   pulseStackStop: null
