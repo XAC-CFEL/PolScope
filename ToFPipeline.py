@@ -689,17 +689,22 @@ class PeakFinder(Configurable):
             sliceDet = sliceDet.sel(sample=slice(roi[0],roi[1]))
             
             sample_coords = sliceDet["sample"].values  # the actual sample indices
-            def peakFuncWithCoords(trace):
+            
+            # Create peak function that converts array indices to actual sample coordinates
+            def peakFuncWithCoords(trace, coords=sample_coords):
                 peaks = findPeaksInTrace_np(trace, peakNo=peakNo, cutOff=threshold,
                                             widthFactor=distanceFactor, symmetric=symmetric,
                                             minWidth=minWidth)
-                # replace positions with real coordinates
+                # replace array indices with real sample coordinates
                 if peaks is not None and len(peaks) > 0:
-                    peaks[:, 0] = sample_coords[peaks[:, 0].astype(int)]
+                    indices = peaks[:, 0].astype(int)
+                    # Clamp indices to valid range
+                    indices = np.clip(indices, 0, len(coords) - 1)
+                    peaks[:, 0] = coords[indices]
                 return peaks
         
             results_det = xr.apply_ufunc(
-                peakFunc,
+                peakFuncWithCoords,
                 sliceDet,
                 input_core_dims=[["sample"]],
                 vectorize=True,
