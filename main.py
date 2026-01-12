@@ -315,9 +315,6 @@ class PlotPreparationWorker(QObject):
                         samples = trace['sample'].values[::self.downsample]
                         values = trace.values[::self.downsample]
                         
-                        # Debug: print sample range for first detector
-                        if i == 0 and len(samples) > 0:
-                            print(f"Detector {det_id}: sample range [{samples[0]:.1f}, {samples[-1]:.1f}], n_samples={len(samples)}")
                         
                         # Get peaks - filter only by detector (independent per detector)
                         # For averaged/rolling buffer data, we don't filter by trainId/pulseId
@@ -907,7 +904,7 @@ class MainWindow(QMainWindow):
         param_layout.addWidget(QLabel("Number of Peaks:"), row, 0)
         self.peak_no_spin = QSpinBox()
         self.peak_no_spin.setRange(1, 20)
-        self.peak_no_spin.setValue(2)
+        self.peak_no_spin.setValue(1)
         self.peak_no_spin.editingFinished.connect(self.update_processing_config)
         param_layout.addWidget(self.peak_no_spin, row, 1)
         
@@ -961,7 +958,7 @@ class MainWindow(QMainWindow):
         row += 1
         polar_layout.addWidget(QLabel("Beta (β):"), row, 0)
         self.polar_beta_spin = QDoubleSpinBox()
-        self.polar_beta_spin.setRange(-4.0, 4.0)
+        self.polar_beta_spin.setRange(-2.0, 2.0)
         self.polar_beta_spin.setSingleStep(0.1)
         self.polar_beta_spin.setDecimals(4)
         # Load default beta from config
