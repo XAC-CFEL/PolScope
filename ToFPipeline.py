@@ -656,17 +656,18 @@ class PeakFinder(Configurable):
         """
         windowSize = windowSize if windowSize is not None else self.config.get("smoothWindow", 5)
         
-        # Apply rolling mean along the sample dimension
-        smoothed = self.data.rolling(sample=windowSize, center=True).mean()
+        # Apply rolling mean along the sample dimension, only where we have enough points
+        smoothed = self.data.rolling(sample=windowSize, center=True, min_periods=windowSize).mean()
         
-        # Trim edges to avoid NaN values - start after windowSize//2 and stop before windowSize//2
-        half_window = windowSize // 2
-        sample_slice = slice(half_window, -half_window if half_window > 0 else None)
-        self.data = smoothed.isel(sample=sample_slice)
+        # Fill NaN values (at edges) with original data to preserve length
+        self.data = smoothed.fillna(self.data)
+        
+        # Rechunk sample dimension to single chunk for downstream processing
+        self.data = self.data.chunk({"sample": -1})
         
         self.data = self.data.persist()
         return self
-
+    
     def process(self, threshold=None, peakNo=None,roi=None, distanceFactor=None, symmetric=None, minWidth=True):
         threshold = threshold if threshold is not None else self.config.get("threshold", 0)
         peakNo = peakNo if peakNo is not None else self.config.get("peakNo", 8)
@@ -900,10 +901,9 @@ class PhotonEnergyProcessor(Configurable):
         return self.results
 
 class Calibrate(Configurable):
-    def __init__(self, data, config=None):
+    def __init__(self, results, config=None):
         super().__init__(config)
-        self.data = data
-        self.results = []
+        self.results = results
         self.energyParam = []
         self.transmissionParam = []
 
@@ -923,7 +923,7 @@ class Calibrate(Configurable):
     def energy(self,relPos=False,peakNo=None,guess=None):
         peakNo = (peakNo or self.config.get("peakNo", 1))
         guess = (guess or self.config.get("initial guess", [0,0.001,10000]))
-        avgPos = self.data.groupby(["detector","peakNo","Photon Energy"])["pos"].mean().reset_index()
+        avgPos = self.results.groupby(["detector","peakNo","Photon Energy"])["pos"].mean().reset_index()
         energyParam = []
         transmissionParam = []
         for det in avgPos["detector"].unique():
@@ -964,27 +964,27 @@ class Calibrate(Configurable):
         beta = beta or self.config.get("beta",0)
         peakNo = peakNo or self.config.get("Transmission PeakNo",0)
         """
-        for energy in self.data["Photon Energy"].unique():
-            for ToF in self.data["detector"].unique():
-                selData = self.data[(self.data["peakNo"]==peakNo)&(self.data["Photon Energy"]==energy)&(self.data["detector"]==ToF)]
+        for energy in self.results["Photon Energy"].unique():
+            for ToF in self.results["detector"].unique():
+                selData = self.results[(self.results["peakNo"]==peakNo)&(self.results["Photon Energy"]==energy)&(self.results["detector"]==ToF)]
                 trace = selData[intMethod].mean()
                 theta = np.deg2rad(selData["Angles"].to_numpy())
                 g = polarization_model(theta, Plin=setPlin, phi=setPhi,beta2=setBeta)
                 transPar = g/trace
-                transmissionParam.append({"detector": ToF, "Photon Energy": energy, "Transmission coefficent": transPar})
+                transmissionParam.append({"detector": ToF, "Photon Energy": energy, "Transmission Coefficient": transPar[0]})
         self.transmissionParam = pd.DataFrame(transmissionParam)
         return self
 
     def plotTransmission(self,ymin=None,ymax=None):
-        plotYNum = int(np.ceil(self.data["detector"].nunique()/4))
+        plotYNum = int(np.ceil(self.results["detector"].nunique()/4))
         fig, ax = plt.subplots(plotYNum,4,figsize=(12, 3*plotYNum),sharex='all', sharey='all')
-        plt.ylabel ('Transmission coefficent')
+        plt.ylabel ('Transmission Coefficient')
         plt.xlabel ('Photon Energy')
         ax = ax.flatten()
         j=0
         for ToF in self.transmissionParam["detector"].unique():
             xdata = self.transmissionParam[(self.transmissionParam["detector"]==ToF)]["Photon Energy"]
-            ydata = self.transmissionParam[(self.transmissionParam["detector"]==ToF)]["Transmission coefficent"]
+            ydata = self.transmissionParam[(self.transmissionParam["detector"]==ToF)]["Transmission Coefficient"]
             ax[j].set_title(f"ToF: {ToF}")
             ax[j].grid(True)
             ax[j].plot(xdata,ydata,marker='.', color = 'teal',  markersize=2 ,alpha=1,linewidth = 0)
@@ -996,7 +996,7 @@ class Calibrate(Configurable):
 
     def plotEnergy(self, peakNo = None, plotReg = True, relPos=False, ymin=None, ymax=None, xmin=None, xmax=None):
         peakNo = (peakNo or self.config.get("peakNo", 1))
-        plotYNum = int(np.ceil(self.data["detector"].nunique()/4))
+        plotYNum = int(np.ceil(self.results["detector"].nunique()/4))
         fig, ax = plt.subplots(plotYNum,4,figsize=(12, 3*plotYNum),sharex='all', sharey='all')
 
         plt.ylabel ('Photon Energy')
@@ -1004,14 +1004,14 @@ class Calibrate(Configurable):
         ax = ax.flatten()
         j=0
             
-        for i in self.data["detector"].unique():
-            pos = self.data[(self.data["detector"]==i)&(self.data["peakNo"]==peakNo)]["pos"].reset_index()
+        for i in self.results["detector"].unique():
+            pos = self.results[(self.results["detector"]==i)&(self.results["peakNo"]==peakNo)]["pos"].reset_index()
             if relPos:
-                pos0 = pd.DataFrame(self.data[(self.data["detector"]==i)&(self.data["peakNo"]==0)]["pos"]).reset_index()
+                pos0 = pd.DataFrame(self.results[(self.results["detector"]==i)&(self.results["peakNo"]==0)]["pos"]).reset_index()
                 pos = pos - pos0
                         
             xdata = pos["pos"]
-            ydata = self.data[(self.data["peakNo"]==peakNo)&(self.data["detector"]==i)]["Photon Energy"]
+            ydata = self.results[(self.results["peakNo"]==peakNo)&(self.results["detector"]==i)]["Photon Energy"]
             
             if plotReg:
                 goodData = self.madFilter(xdata,ydata)
@@ -1036,19 +1036,26 @@ class Fitter(Configurable):
     def __init__(self, results, config=None):
         super().__init__(config)
         self.results = results
+        ToFs = self.results["detector"].unique()
+        params = pd.DataFrame(columns=["detector","Photon Energy","Transmission Coefficient"],index=ToFs)
+        params["detector"] = ToFs
+        params["Photon Energy"] = self.results["Photon Energy"].unique()
+        params["Transmission Coefficient"] = [1]*len(ToFs)
+        self.params = params
 
-    def pol(self, transParam, peakNo=None,beta=0,intMethod="fwhm area",plot=True):
+
+    def pol(self, transParam=None, peakNo=None,beta=0,intMethod="fwhm area",plot=True):
         peakNo = peakNo if peakNo is not None else self.config.get("peakNo", 0)
-        
+        transParam = transParam if transParam is not None else self.params
         fullTheta = np.linspace(0,2*np.pi,16,endpoint=False)
         area = self.results[self.results["peakNo"]==peakNo][["fwhm area","height","detector","Angles"]]
         calib = transParam
         calibArea = pd.merge(area,calib,on="detector")
-        calibArea["calibValue"] = calibArea[intMethod] * calibArea["Transmission coefficent"] #/ max(calibArea[intMethod])
+        calibArea["calibValue"] = calibArea[intMethod] * calibArea["Transmission Coefficient"] #/ max(calibArea[intMethod])
             
         theta = calibArea["Angles"].values*np.pi/180
         trace = calibArea["calibValue"]
-        maxTrace = max(trace)[0]
+        maxTrace = max(trace)#[0]
         
     
         def model(theta,Plin,phi,scale):
