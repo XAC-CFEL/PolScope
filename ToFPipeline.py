@@ -1039,7 +1039,7 @@ class Fitter(Configurable):
         ToFs = self.results["detector"].unique()
         params = pd.DataFrame(columns=["detector","Photon Energy","Transmission Coefficient"],index=ToFs)
         params["detector"] = ToFs
-        params["Photon Energy"] = self.results["Photon Energy"].unique()
+        params["Photon Energy"] = self.results["Photon Energy"]
         params["Transmission Coefficient"] = [1]*len(ToFs)
         self.params = params
 
@@ -1062,7 +1062,7 @@ class Fitter(Configurable):
             return polarization_model(theta, Plin=Plin, phi=phi, beta2=beta, scale=scale)
             
         initial_guess = [0.2, 0.0,1.0]  # [Plin, phi, scale]
-        bounds = ([0.0, -np.pi,0], [2, np.pi,2])
+        bounds = ([0.0, -np.pi,0], [2, np.pi,10])
         
         # More precise fitting parameters for small values
         popt, pcov = curve_fit(model, theta, trace, p0=initial_guess, bounds=bounds,
