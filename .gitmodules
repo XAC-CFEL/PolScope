@@ -1,0 +1,3 @@
+[submodule "ToFPipeline"]
+	path = ToFPipeline
+	url = https://github.com/XAC-CFEL/ToFPipeline
