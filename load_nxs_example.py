@@ -18,11 +18,11 @@ The resulting DataArray has the format:
 
 import numpy as np
 from pathlib import Path
-from ToFPipeline import GlobalConfig, NXSLoader
+from ToFPipeline.ToFPipeline import GlobalConfig, NXSLoader
 
 def main():
     # Load configuration
-    config_path = "config.yaml"
+    config_path = "ToFPipeline/config.yaml"
     GlobalConfig.load(config_path)
     print(f"Loaded configuration from {config_path}")
     

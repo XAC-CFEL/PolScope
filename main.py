@@ -24,7 +24,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 
-from ToFPipeline import NXSLoader, PeakFinder, GlobalConfig, polarization_model
+from ToFPipeline.ToFPipeline import NXSLoader, PeakFinder, GlobalConfig, polarization_model
 from scipy.optimize import curve_fit
 
 
@@ -52,7 +52,7 @@ COLOR_GRAY = '#808080'                      # Gray for N/A text
 
 
 # Load global configuration from config.yaml
-config_path = Path(__file__).parent / "config.yaml"
+config_path = Path(__file__).parent / "ToFPipeline/config.yaml"
 if config_path.exists():
     GlobalConfig.load(config_path)
 
