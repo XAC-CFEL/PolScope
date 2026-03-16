@@ -74,7 +74,7 @@ def process_detector_chunk(args):
         # Apply smoothing if window size > 1
         smooth_window = config.get('smoothWindow', 1)
         if smooth_window > 1:
-            pf.smooth(windowSize=smooth_window)
+            pf.smooth(windowSize=smooth_window).smooth(windowSize=smooth_window)
         
         # Find peaks (ROI already applied, so pass [None, None])
         pf.process(roi=[None, None])
