@@ -26,7 +26,8 @@ from ToFPipeline.ToFPipeline import GlobalConfig
 from models import PlotData
 from data_ingestion import CircularBuffer, DataStreamSimulator, DoocspieStream
 from processing import process_detector_chunk, PerformanceMonitor, PlotPreparationWorker
-from plotting import FastMplCanvas, PolarPlotCanvas, AngularHeatmapCanvas
+from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT
+from plotting import FastMplCanvas, PolarPlotCanvas, AngularHeatmapCanvas, SingleDetectorCanvas
 
 
 class MainWindow(QMainWindow):
@@ -113,6 +114,24 @@ class MainWindow(QMainWindow):
         self.heatmap_canvas = AngularHeatmapCanvas(self, width=7, height=7, dpi=100)
         self.tab_widget.addTab(self.heatmap_canvas, "Angular Heatmap")
 
+        # Tab 4: Single Detector (interactive zoom/pan)
+        self.single_det_widget = QWidget()
+        single_det_layout = QVBoxLayout(self.single_det_widget)
+        selector_layout = QHBoxLayout()
+        selector_layout.addWidget(QLabel("Detector:"))
+        self.single_det_combo = QComboBox()
+        for i in range(16):
+            self.single_det_combo.addItem(f"Det {i}")
+        self.single_det_combo.currentIndexChanged.connect(self.on_single_det_changed)
+        selector_layout.addWidget(self.single_det_combo)
+        selector_layout.addStretch()
+        single_det_layout.addLayout(selector_layout)
+        self.single_det_canvas = SingleDetectorCanvas(self, width=8, height=6, dpi=100)
+        self.single_det_toolbar = NavigationToolbar2QT(self.single_det_canvas, self.single_det_widget)
+        single_det_layout.addWidget(self.single_det_toolbar)
+        single_det_layout.addWidget(self.single_det_canvas)
+        self.tab_widget.addTab(self.single_det_widget, "Single Detector")
+
         # Connect tab change signal to update results when Results tab is selected
         self.tab_widget.currentChanged.connect(self.on_tab_changed)
 
@@ -128,6 +147,7 @@ class MainWindow(QMainWindow):
         self.plots_need_update = False    # Flag for detector plots
         self.polar_needs_update = False   # Flag for polar plot updates
         self.heatmap_needs_update = False  # Flag for angular heatmap updates
+        self.single_det_needs_update = False  # Flag for single detector plot
 
     def create_control_panel(self):
         """Create control panel"""
@@ -383,6 +403,10 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         btn_layout.addWidget(self.stop_btn)
 
+        self.clear_buffer_btn = QPushButton("Clear Buffer")
+        self.clear_buffer_btn.clicked.connect(self.clear_buffer)
+        btn_layout.addWidget(self.clear_buffer_btn)
+
         btn_group.setLayout(btn_layout)
         layout.addWidget(btn_group)
 
@@ -569,6 +593,15 @@ class MainWindow(QMainWindow):
         self.canvas = FastMplCanvas(self, width=10, height=8, dpi=100, n_detectors=self.n_detectors)
         self.tab_widget.insertTab(0, self.canvas, "Plots")
         self.tab_widget.setCurrentIndex(0)  # Make sure Plots tab is active
+
+        # Update single detector dropdown to match new detector count
+        self.single_det_combo.blockSignals(True)
+        current_det = self.single_det_combo.currentIndex()
+        self.single_det_combo.clear()
+        for i in range(self.n_detectors):
+            self.single_det_combo.addItem(f"Det {i}")
+        self.single_det_combo.setCurrentIndex(min(current_det, self.n_detectors - 1))
+        self.single_det_combo.blockSignals(False)
 
     def setup_workers(self):
         """Setup process pool and plotting workers"""
@@ -774,10 +807,17 @@ class MainWindow(QMainWindow):
                     if normalized_data is not None:
                         self.stage_load['normalized_data'][worker_id] = normalized_data
 
-                    # Store results - peak positions are already in correct sample coordinates
-                    # (ROI is applied early in stack_buffer_data, and PeakFinder converts
-                    # array indices to actual sample coordinates)
+                    # Correct peak positions for ROI offset: PeakFinder returns 0-based array
+                    # indices, but the trace is displayed using the actual sample coordinates
+                    # (which start at roi_start). Adding roi_start aligns markers with trace.
                     if results is not None and isinstance(self.stage_load['results'], list):
+                        roi_start = self.processing_config.get('roi', [0, 10000])[0]
+                        if roi_start and roi_start > 0 and not results.empty:
+                            results = results.copy()
+                            results['pos'] = results['pos'] + roi_start
+                            for col in ('baseline left', 'baseline right'):
+                                if col in results.columns:
+                                    results[col] = results[col] + roi_start
                         self.stage_load['results'].append(results)
 
                     self.stage_load['finished_count'] += 1
@@ -873,6 +913,12 @@ class MainWindow(QMainWindow):
         else:
             self.heatmap_needs_update = True
 
+        # Update single detector plot if visible or flag for update
+        if self.tab_widget.currentIndex() == 4:  # Single Detector tab
+            self.update_single_detector_plot(plot_data_list)
+        else:
+            self.single_det_needs_update = True
+
     def on_tab_changed(self, index):
         """Handle tab changes - update views when tabs are selected"""
         if index == 0 and self.plots_need_update:  # Plots tab
@@ -889,6 +935,10 @@ class MainWindow(QMainWindow):
         elif index == 3 and self.heatmap_needs_update:  # Angular Heatmap tab
             self.update_heatmap_plot()
             self.heatmap_needs_update = False
+        elif index == 4 and self.single_det_needs_update:  # Single Detector tab
+            if self.last_plot_data is not None:
+                self.update_single_detector_plot(self.last_plot_data)
+            self.single_det_needs_update = False
 
     def on_polar_param_changed(self):
         """Handle changes to polar plot parameters"""
@@ -900,6 +950,8 @@ class MainWindow(QMainWindow):
         if self.last_plot_data is not None and self.tab_widget.currentIndex() == 0:
             self.canvas.background = None  # Force full redraw so artists are registered
             self.canvas.fast_update(self.last_plot_data, show_baseline=bool(state))
+        elif self.last_plot_data is not None and self.tab_widget.currentIndex() == 4:
+            self.update_single_detector_plot(self.last_plot_data)
 
     def on_heatmap_param_changed(self):
         """Update heatmap when controls change"""
@@ -918,6 +970,29 @@ class MainWindow(QMainWindow):
             interpolate=self.heatmap_interpolate_check.isChecked(),
             show_peaks=self.heatmap_showpeaks_check.isChecked(),
         )
+
+    def update_single_detector_plot(self, plot_data_list):
+        """Update the single detector canvas with the currently selected detector"""
+        if plot_data_list is None:
+            return
+        det_idx = self.single_det_combo.currentIndex()
+        if det_idx < 0 or det_idx >= len(plot_data_list):
+            return
+        plot_data = plot_data_list[det_idx]
+        self.single_det_canvas.ax.set_title(f'Detector {det_idx}', fontsize=10)
+        self.single_det_canvas.update_plot(
+            plot_data, show_baseline=self.show_baseline_check.isChecked()
+        )
+
+    def on_single_det_changed(self, index):
+        """Redraw single detector plot when dropdown selection changes"""
+        if self.last_plot_data is not None and self.tab_widget.currentIndex() == 4:
+            self.update_single_detector_plot(self.last_plot_data)
+
+    def clear_buffer(self):
+        """Clear the circular buffer"""
+        if self.circular_buffer is not None:
+            self.circular_buffer.clear()
 
     def load_calibration_file(self):
         """Open a calib.yaml and load per-detector transmission coefficients"""

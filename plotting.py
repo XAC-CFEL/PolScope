@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib
 matplotlib.use('Qt5Agg')
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
 from matplotlib.collections import LineCollection
 from scipy.optimize import curve_fit
@@ -637,5 +637,123 @@ class AngularHeatmapCanvas(FigureCanvasQTAgg):
                 self.ax.scatter([ang], [pos], color='red', s=20, zorder=6)
                 self.ax.plot([ang, ang], [pos + wl, pos + wr],
                              color='red', linewidth=0.8, zorder=6)
+
+        self.draw_idle()
+
+
+class SingleDetectorCanvas(FigureCanvasQTAgg):
+    """Matplotlib canvas for a single detector with interactive zoom/pan via toolbar"""
+
+    def __init__(self, parent=None, width=8, height=6, dpi=100):
+        self.fig = Figure(figsize=(width, height), dpi=dpi)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.grid(True, alpha=0.3)
+        self.ax.set_title('Detector 0', fontsize=10)
+        self.ax.tick_params(labelsize=8)
+        self.ax.set_ylim([-0.1, 1.1])
+        self.ax.set_xlim([0, 1000])
+        self.ax.ticklabel_format(style='plain', axis='x', useOffset=False)
+        self.ax.xaxis.get_major_formatter().set_scientific(False)
+        self.fig.tight_layout()
+        super().__init__(self.fig)
+
+        self.line, = self.ax.plot([], [], color=COLOR_TRACE, linewidth=0.8, alpha=0.9)
+        self.scatter = self.ax.scatter([], [], color=COLOR_PEAK, s=40, zorder=5)
+
+        self.fwhm_lc = LineCollection([], colors=COLOR_FWHM, linewidths=1.5, zorder=4)
+        self.ax.add_collection(self.fwhm_lc)
+
+        self.baseline_lc = LineCollection([], colors=_COLOR_BASELINE, linewidths=1.2,
+                                          linestyles='dashed', zorder=3)
+        self.ax.add_collection(self.baseline_lc)
+
+        self.adj_lines = []
+        for _ in range(_MAX_BASELINE_PEAKS):
+            adj_line, = self.ax.plot([], [], color=_COLOR_ADJUSTED, linestyle='dotted',
+                                     linewidth=1.0, alpha=0.7, zorder=3)
+            self.adj_lines.append(adj_line)
+
+        self.text_obj = self.ax.text(0.5, 0.5, '', ha='center', va='center',
+                                     transform=self.ax.transAxes, fontsize=12, color=COLOR_GRAY)
+        self.text_obj.set_visible(False)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.fig.tight_layout()
+        self.draw_idle()
+
+    def update_plot(self, plot_data: PlotData, show_baseline: bool = True):
+        """Update the canvas with data for a single detector"""
+        if plot_data is None or not plot_data.has_data:
+            self.line.set_data([], [])
+            self.scatter.set_offsets(np.empty((0, 2)))
+            self.fwhm_lc.set_segments([])
+            self.baseline_lc.set_segments([])
+            for al in self.adj_lines:
+                al.set_data([], [])
+            self.text_obj.set_text('N/A')
+            self.text_obj.set_color(COLOR_GRAY)
+            self.text_obj.set_visible(True)
+            self.ax.set_facecolor('white')
+            self.draw_idle()
+            return
+
+        if not plot_data.is_enabled:
+            self.line.set_data([], [])
+            self.scatter.set_offsets(np.empty((0, 2)))
+            self.fwhm_lc.set_segments([])
+            self.baseline_lc.set_segments([])
+            for al in self.adj_lines:
+                al.set_data([], [])
+            self.text_obj.set_text('OFF')
+            self.text_obj.set_color(COLOR_DISABLED)
+            self.text_obj.set_visible(True)
+            self.ax.set_facecolor('#ffeeee')
+            self.draw_idle()
+            return
+
+        self.text_obj.set_visible(False)
+        self.ax.set_facecolor('white')
+
+        if len(plot_data.samples) > 0:
+            self.line.set_data(plot_data.samples, plot_data.values)
+            xmin = float(plot_data.samples[0])
+            xmax = float(plot_data.samples[-1])
+            if xmax > xmin:
+                self.ax.set_xlim([xmin, xmax])
+            self.ax.relim()
+            self.ax.autoscale_view(scalex=False, scaley=True)
+        else:
+            self.line.set_data([], [])
+
+        if plot_data.peak_positions is not None:
+            self.scatter.set_offsets(plot_data.peak_positions)
+        else:
+            self.scatter.set_offsets(np.empty((0, 2)))
+
+        if plot_data.fwhm_lines is not None and len(plot_data.fwhm_lines) > 0:
+            segments = []
+            for fwhm in plot_data.fwhm_lines:
+                pos, widthL, widthR, half_height = fwhm
+                segments.append([(pos + widthL, half_height), (pos + widthR, half_height)])
+            self.fwhm_lc.set_segments(segments)
+        else:
+            self.fwhm_lc.set_segments([])
+
+        if show_baseline and plot_data.baseline_data:
+            bl_segments = []
+            for peak_idx, bd in enumerate(plot_data.baseline_data):
+                bl_segments.append([(bd['bl_x'][0], bd['bl_y'][0]),
+                                     (bd['bl_x'][1], bd['bl_y'][1])])
+                if peak_idx < len(self.adj_lines):
+                    self.adj_lines[peak_idx].set_data(bd['adj_x'], bd['adj_y'])
+            self.baseline_lc.set_segments(bl_segments)
+            n_peaks = len(plot_data.baseline_data)
+            for k in range(n_peaks, len(self.adj_lines)):
+                self.adj_lines[k].set_data([], [])
+        else:
+            self.baseline_lc.set_segments([])
+            for al in self.adj_lines:
+                al.set_data([], [])
 
         self.draw_idle()
