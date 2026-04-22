@@ -1,4 +1,5 @@
 import sys
+import multiprocessing
 from pathlib import Path
 from PyQt6.QtWidgets import QApplication
 from ToFPipeline.ToFPipeline import GlobalConfig
@@ -19,4 +20,7 @@ def main():
 
 
 if __name__ == '__main__':
+    # Use 'spawn' on all platforms so forking never copies Qt's internal state
+    # into the worker process (critical on Linux where 'fork' is the default).
+    multiprocessing.set_start_method('spawn')
     main()
