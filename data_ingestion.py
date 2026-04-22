@@ -13,15 +13,16 @@ from ToFPipeline.ToFPipeline import NXSLoader
 # can pickle them when starting the worker process on Windows.
 # ---------------------------------------------------------------------------
 
-def _convert_train_event(train_event, n_detectors: int) -> xr.DataArray:
+def _convert_train_event(train_event, addresses: list) -> xr.DataArray:
     """Convert a doocspie TrainEvent to an xr.DataArray."""
     train_id = train_event.id
+    n_detectors = len(addresses)
     detector_arrays = []
     n_pulses = None
     n_samples = None
 
-    for i in range(n_detectors):
-        readout = train_event.get(f'det_{i}')
+    for i, addr in enumerate(addresses):
+        readout = train_event.get(addr)
         arr = np.asarray(readout.data, dtype=np.float64)
         if arr.ndim == 1:
             arr = arr[np.newaxis, :]   # (1, n_samples)
@@ -51,16 +52,15 @@ def _doocspie_worker(addresses, timeout_seconds, queue, stop_event):
     """Worker process: blocks on successive trains and enqueues DataArrays."""
     from doocspie.abo import TrainAbo
 
-    n_detectors = len(addresses)
     train_abo = TrainAbo(timeout_seconds=timeout_seconds)
-    for i, addr in enumerate(addresses):
-        train_abo.add(addr, label=f'det_{i}')
+    for addr in addresses:
+        train_abo.add(addr)
 
     for train_event in train_abo:
         if stop_event.is_set():
             break
         try:
-            da = _convert_train_event(train_event, n_detectors)
+            da = _convert_train_event(train_event, addresses)
             if queue.full():
                 try:
                     queue.get_nowait()
