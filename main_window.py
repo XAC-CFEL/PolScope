@@ -126,8 +126,20 @@ class MainWindow(QMainWindow):
         selector_layout.addWidget(self.single_det_combo)
         selector_layout.addStretch()
         single_det_layout.addLayout(selector_layout)
-        self.single_det_canvas = SingleDetectorCanvas(self, width=8, height=6, dpi=100)
+        self.single_det_canvas = SingleDetectorCanvas(self, width=8, height=4, dpi=100)
         self.single_det_toolbar = NavigationToolbar2QT(self.single_det_canvas, self.single_det_widget)
+        # Patch toolbar so we know when the user has zoomed/panned vs. pressed Home
+        _canvas = self.single_det_canvas
+        _orig_push = self.single_det_toolbar.push_current
+        _orig_home = self.single_det_toolbar.home
+        def _on_push_current():
+            _canvas._user_navigated = True
+            _orig_push()
+        def _on_home(*args, **kwargs):
+            _canvas._user_navigated = False
+            _orig_home(*args, **kwargs)
+        self.single_det_toolbar.push_current = _on_push_current
+        self.single_det_toolbar.home = _on_home
         single_det_layout.addWidget(self.single_det_toolbar)
         single_det_layout.addWidget(self.single_det_canvas)
         self.tab_widget.addTab(self.single_det_widget, "Single Detector")
@@ -986,6 +998,8 @@ class MainWindow(QMainWindow):
 
     def on_single_det_changed(self, index):
         """Redraw single detector plot when dropdown selection changes"""
+        # Reset navigation so the new detector auto-scales on next update
+        self.single_det_canvas._user_navigated = False
         if self.last_plot_data is not None and self.tab_widget.currentIndex() == 4:
             self.update_single_detector_plot(self.last_plot_data)
 

@@ -644,7 +644,7 @@ class AngularHeatmapCanvas(FigureCanvasQTAgg):
 class SingleDetectorCanvas(FigureCanvasQTAgg):
     """Matplotlib canvas for a single detector with interactive zoom/pan via toolbar"""
 
-    def __init__(self, parent=None, width=8, height=6, dpi=100):
+    def __init__(self, parent=None, width=8, height=4, dpi=100):
         self.fig = Figure(figsize=(width, height), dpi=dpi)
         self.ax = self.fig.add_subplot(111)
         self.ax.grid(True, alpha=0.3)
@@ -654,8 +654,9 @@ class SingleDetectorCanvas(FigureCanvasQTAgg):
         self.ax.set_xlim([0, 1000])
         self.ax.ticklabel_format(style='plain', axis='x', useOffset=False)
         self.ax.xaxis.get_major_formatter().set_scientific(False)
-        self.fig.tight_layout()
+        self.fig.tight_layout(pad=1.5)
         super().__init__(self.fig)
+        self.setMaximumHeight(520)
 
         self.line, = self.ax.plot([], [], color=COLOR_TRACE, linewidth=0.8, alpha=0.9)
         self.scatter = self.ax.scatter([], [], color=COLOR_PEAK, s=40, zorder=5)
@@ -677,9 +678,12 @@ class SingleDetectorCanvas(FigureCanvasQTAgg):
                                      transform=self.ax.transAxes, fontsize=12, color=COLOR_GRAY)
         self.text_obj.set_visible(False)
 
+        # _user_navigated: set to True when user zooms/pans so we stop overriding limits
+        self._user_navigated = False
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.fig.tight_layout()
+        self.fig.tight_layout(pad=1.5)
         self.draw_idle()
 
     def update_plot(self, plot_data: PlotData, show_baseline: bool = True):
@@ -717,12 +721,13 @@ class SingleDetectorCanvas(FigureCanvasQTAgg):
 
         if len(plot_data.samples) > 0:
             self.line.set_data(plot_data.samples, plot_data.values)
-            xmin = float(plot_data.samples[0])
-            xmax = float(plot_data.samples[-1])
-            if xmax > xmin:
-                self.ax.set_xlim([xmin, xmax])
-            self.ax.relim()
-            self.ax.autoscale_view(scalex=False, scaley=True)
+            if not self._user_navigated:
+                xmin = float(plot_data.samples[0])
+                xmax = float(plot_data.samples[-1])
+                if xmax > xmin:
+                    self.ax.set_xlim([xmin, xmax])
+                self.ax.relim()
+                self.ax.autoscale_view(scalex=False, scaley=True)
         else:
             self.line.set_data([], [])
 
