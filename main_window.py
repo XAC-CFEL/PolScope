@@ -156,6 +156,17 @@ class MainWindow(QMainWindow):
             "FACILITY/DEVICE/LOCATION/PROPERTY.TD\n..."
         )
         self.doocs_addresses_edit.setMaximumHeight(100)
+        
+        # Load addresses from config if available
+        doocs_config = GlobalConfig.get_for_class('DoocspieStream')
+        if doocs_config and 'addresses' in doocs_config:
+            addresses_cfg = doocs_config['addresses']
+            if isinstance(addresses_cfg, dict):
+                addresses_list = [addresses_cfg[k] for k in sorted(addresses_cfg)]
+            else:
+                addresses_list = list(addresses_cfg)
+            self.doocs_addresses_edit.setPlainText('\n'.join(addresses_list))
+        
         doocs_src_layout.addWidget(self.doocs_addresses_edit)
         self.doocs_source_widget.setVisible(False)
         source_layout.addWidget(self.doocs_source_widget)

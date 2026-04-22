@@ -91,11 +91,15 @@ class DoocspieStream:
         Timeout for the TrainAbo synchronisation backend (default 10 s).
     """
 
-    def __init__(self, addresses: list, timeout_seconds: int = 10):
+    def __init__(self, addresses, timeout_seconds: int = 10):
         from doocspie.abo import TrainAbo
 
-        self.n_detectors = len(addresses)
-        self._addresses = list(addresses)
+        # Accept either a list or a keyed dict (e.g. {1: addr1, 2: addr2, ...})
+        if isinstance(addresses, dict):
+            self._addresses = [addresses[k] for k in sorted(addresses)]
+        else:
+            self._addresses = list(addresses)
+        self.n_detectors = len(self._addresses)
         # Expose .data so MainWindow can call len(stream.data.coords['detector'])
         self.data = _DataProxy(self.n_detectors)
 
