@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout,
                               QTextEdit, QCheckBox, QScrollArea, QTabWidget,
                               QTableWidget, QTableWidgetItem, QHeaderView,
                               QComboBox, QRadioButton, QMessageBox)
-from PyQt6.QtCore import QTimer, pyqtSlot
+from PyQt6.QtCore import Qt, QTimer, pyqtSlot
 from PyQt6.QtGui import QFont
 
 from ToFPipeline.ToFPipeline import GlobalConfig
@@ -84,9 +84,13 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(main_widget)
         main_layout = QHBoxLayout(main_widget)
 
-        # Left panel - Controls
+        # Left panel - Controls (wrapped in a scroll area so it doesn't get cut off)
         left_panel = self.create_control_panel()
-        main_layout.addWidget(left_panel, stretch=1)
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left_scroll.setWidget(left_panel)
+        main_layout.addWidget(left_scroll, stretch=1)
 
         # Right panel - Tabbed view (Plots + Results)
         self.tab_widget = QTabWidget()
