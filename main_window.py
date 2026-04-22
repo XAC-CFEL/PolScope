@@ -1,0 +1,871 @@
+import time
+import numpy as np
+import xarray as xr
+import pandas as pd
+from pathlib import Path
+from threading import Thread
+from concurrent.futures import ProcessPoolExecutor
+from typing import List
+
+from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout,
+                              QHBoxLayout, QLabel, QPushButton, QSpinBox,
+                              QDoubleSpinBox, QGroupBox, QGridLayout, QFileDialog,
+                              QTextEdit, QCheckBox, QScrollArea, QTabWidget,
+                              QTableWidget, QTableWidgetItem, QHeaderView,
+                              QComboBox, QRadioButton)
+from PyQt6.QtCore import QTimer, pyqtSlot
+from PyQt6.QtGui import QFont
+
+from ToFPipeline.ToFPipeline import GlobalConfig
+
+from models import PlotData
+from data_ingestion import CircularBuffer, DataStreamSimulator, DoocspieStream
+from processing import process_detector_chunk, PerformanceMonitor, PlotPreparationWorker
+from plotting import FastMplCanvas, PolarPlotCanvas
+
+
+class MainWindow(QMainWindow):
+    """Main application window"""
+
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowTitle("Real-time ToF Data Processing")
+        self.setGeometry(100, 100, 1400, 900)
+
+        # State variables
+        self.running = False
+        self.data_simulator = None
+        self.circular_buffer = None
+        self.performance_monitor = PerformanceMonitor()
+        self.n_detectors = 16
+        self.enabled_detectors = set(range(16))
+        self.detector_checkboxes = []
+
+        # Process pool for parallel processing (bypasses GIL)
+        self.process_pool = None
+        self.processing_futures = []
+
+        # Plot worker (thread is fine for I/O-bound plot prep)
+        self.plot_worker = None
+        self.plot_thread = None
+
+        # Processing config
+        self.processing_config = {}
+
+        # Pipeline stages
+        self.stage_load = None
+        self.stage_process = None
+        self.stage_plot = None
+
+        # Setup UI
+        self.setup_ui()
+
+        # Timers
+        self.main_timer = QTimer()
+        self.main_timer.timeout.connect(self.main_loop_iteration)
+
+        self.perf_timer = QTimer()
+        self.perf_timer.timeout.connect(self.update_performance_display)
+        self.perf_timer.start(500)
+
+    def setup_ui(self):
+        """Setup the user interface"""
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QHBoxLayout(main_widget)
+
+        # Left panel - Controls
+        left_panel = self.create_control_panel()
+        main_layout.addWidget(left_panel, stretch=1)
+
+        # Right panel - Tabbed view (Plots + Results)
+        self.tab_widget = QTabWidget()
+
+        # Tab 1: Plots
+        self.canvas = FastMplCanvas(self, width=10, height=8, dpi=100, n_detectors=16)
+        self.tab_widget.addTab(self.canvas, "Plots")
+
+        # Tab 2: Results Table
+        self.results_table = QTableWidget()
+        self.results_table.setColumnCount(9)
+        self.results_table.setHorizontalHeaderLabels([
+            "detector", "trainId", "pulseId", "peakNo",
+            "pos", "height", "width left", "width right", "fwhm area"
+        ])
+        self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.results_table.setAlternatingRowColors(True)
+        self.tab_widget.addTab(self.results_table, "Results")
+
+        # Tab 3: Polarization Plot
+        self.polar_canvas = PolarPlotCanvas(self, width=6, height=6, dpi=100)
+        self.tab_widget.addTab(self.polar_canvas, "Polarization")
+
+        # Connect tab change signal to update results when Results tab is selected
+        self.tab_widget.currentChanged.connect(self.on_tab_changed)
+
+        # Ensure Plots tab is selected by default
+        self.tab_widget.setCurrentIndex(0)
+
+        main_layout.addWidget(self.tab_widget, stretch=3)
+
+        # Store last results for inspection
+        self.last_results_df = None
+        self.last_plot_data = None        # Store last plot data for deferred updates
+        self.results_need_update = False  # Flag to track if results need updating
+        self.plots_need_update = False    # Flag for detector plots
+        self.polar_needs_update = False   # Flag for polar plot updates
+
+    def create_control_panel(self):
+        """Create control panel"""
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+
+        # Data Source (mode-switching group)
+        source_group = QGroupBox("Data Source")
+        source_layout = QVBoxLayout()
+
+        # Mode radio buttons
+        mode_layout = QHBoxLayout()
+        self.file_mode_radio = QRadioButton("File (NXS)")
+        self.doocs_mode_radio = QRadioButton("Live (DOOCS)")
+        self.file_mode_radio.setChecked(True)
+        mode_layout.addWidget(self.file_mode_radio)
+        mode_layout.addWidget(self.doocs_mode_radio)
+        source_layout.addLayout(mode_layout)
+
+        # File source widget
+        self.file_source_widget = QWidget()
+        file_src_layout = QVBoxLayout(self.file_source_widget)
+        file_src_layout.setContentsMargins(0, 0, 0, 0)
+        self.file_label = QLabel("No folder selected")
+        self.file_label.setWordWrap(True)
+        file_src_layout.addWidget(self.file_label)
+        file_btn = QPushButton("Select .nxs Folder")
+        file_btn.clicked.connect(self.select_file)
+        file_src_layout.addWidget(file_btn)
+        source_layout.addWidget(self.file_source_widget)
+
+        # DOOCS source widget
+        self.doocs_source_widget = QWidget()
+        doocs_src_layout = QVBoxLayout(self.doocs_source_widget)
+        doocs_src_layout.setContentsMargins(0, 0, 0, 0)
+        doocs_src_layout.addWidget(QLabel("DOOCS addresses (one per detector):"))
+        self.doocs_addresses_edit = QTextEdit()
+        self.doocs_addresses_edit.setPlaceholderText(
+            "FACILITY/DEVICE/LOCATION/PROPERTY.TD\n..."
+        )
+        self.doocs_addresses_edit.setMaximumHeight(100)
+        doocs_src_layout.addWidget(self.doocs_addresses_edit)
+        self.doocs_source_widget.setVisible(False)
+        source_layout.addWidget(self.doocs_source_widget)
+
+        self.file_mode_radio.toggled.connect(self._on_source_mode_changed)
+
+        source_group.setLayout(source_layout)
+        layout.addWidget(source_group)
+
+        # Processing parameters
+        param_group = QGroupBox("Processing Parameters")
+        param_layout = QGridLayout()
+
+        row = 0
+        param_layout.addWidget(QLabel("Buffer Size:"), row, 0)
+        self.buffer_size_spin = QSpinBox()
+        self.buffer_size_spin.setRange(1, 100)
+        self.buffer_size_spin.setValue(1)
+        param_layout.addWidget(self.buffer_size_spin, row, 1)
+
+        row += 1
+        param_layout.addWidget(QLabel("Detectors/Thread:"), row, 0)
+        self.det_per_thread_spin = QSpinBox()
+        self.det_per_thread_spin.setRange(1, 16)
+        self.det_per_thread_spin.setValue(4)
+        param_layout.addWidget(self.det_per_thread_spin, row, 1)
+
+        row += 1
+        param_layout.addWidget(QLabel("Pipeline Depth:"), row, 0)
+        self.pipeline_depth_spin = QSpinBox()
+        self.pipeline_depth_spin.setRange(1, 10)
+        self.pipeline_depth_spin.setValue(3)
+        self.pipeline_depth_spin.setToolTip("Number of processing batches that can run in parallel")
+        param_layout.addWidget(self.pipeline_depth_spin, row, 1)
+
+        row += 1
+        param_layout.addWidget(QLabel("Update Rate (Hz):"), row, 0)
+        self.update_rate_spin = QSpinBox()
+        self.update_rate_spin.setRange(1, 50)
+        self.update_rate_spin.setValue(10)
+        param_layout.addWidget(self.update_rate_spin, row, 1)
+
+        row += 1
+        param_layout.addWidget(QLabel("Plot Downsample:"), row, 0)
+        self.downsample_spin = QSpinBox()
+        self.downsample_spin.setRange(1, 20)
+        self.downsample_spin.setValue(1)
+        self.downsample_spin.valueChanged.connect(self.on_downsample_changed)
+        param_layout.addWidget(self.downsample_spin, row, 1)
+
+        row += 1
+        param_layout.addWidget(QLabel("Peak Threshold:"), row, 0)
+        self.threshold_spin = QDoubleSpinBox()
+        self.threshold_spin.setRange(0, 1)
+        self.threshold_spin.setSingleStep(0.01)
+        self.threshold_spin.setValue(0.1)
+        self.threshold_spin.editingFinished.connect(self.update_processing_config)
+        param_layout.addWidget(self.threshold_spin, row, 1)
+
+        row += 1
+        param_layout.addWidget(QLabel("Number of Peaks:"), row, 0)
+        self.peak_no_spin = QSpinBox()
+        self.peak_no_spin.setRange(1, 20)
+        self.peak_no_spin.setValue(1)
+        self.peak_no_spin.editingFinished.connect(self.update_processing_config)
+        param_layout.addWidget(self.peak_no_spin, row, 1)
+
+        row += 1
+        param_layout.addWidget(QLabel("ROI Start:"), row, 0)
+        self.roi_start_spin = QSpinBox()
+        self.roi_start_spin.setRange(0, 10000)
+        self.roi_start_spin.setValue(0)
+        self.roi_start_spin.editingFinished.connect(self.update_processing_config)
+        param_layout.addWidget(self.roi_start_spin, row, 1)
+
+        row += 1
+        param_layout.addWidget(QLabel("ROI End:"), row, 0)
+        self.roi_end_spin = QSpinBox()
+        self.roi_end_spin.setRange(0, 10000)
+        self.roi_end_spin.setValue(1000)
+        self.roi_end_spin.editingFinished.connect(self.update_processing_config)
+        param_layout.addWidget(self.roi_end_spin, row, 1)
+
+        row += 1
+        param_layout.addWidget(QLabel("Smooth Window:"), row, 0)
+        self.smooth_window_spin = QSpinBox()
+        self.smooth_window_spin.setRange(1, 50)
+        self.smooth_window_spin.setValue(5)
+        self.smooth_window_spin.setToolTip("Window size for rolling average smoothing (1 = no smoothing)")
+        self.smooth_window_spin.editingFinished.connect(self.update_processing_config)
+        param_layout.addWidget(self.smooth_window_spin, row, 1)
+
+        param_group.setLayout(param_layout)
+        layout.addWidget(param_group)
+
+        # Polarization Plot Parameters
+        polar_group = QGroupBox("Polarization Plot")
+        polar_layout = QGridLayout()
+
+        row = 0
+        polar_layout.addWidget(QLabel("Peak Number:"), row, 0)
+        self.polar_peak_spin = QSpinBox()
+        self.polar_peak_spin.setRange(0, 19)
+        self.polar_peak_spin.setValue(0)
+        self.polar_peak_spin.valueChanged.connect(self.on_polar_param_changed)
+        polar_layout.addWidget(self.polar_peak_spin, row, 1)
+
+        row += 1
+        polar_layout.addWidget(QLabel("Value Type:"), row, 0)
+        self.polar_value_combo = QComboBox()
+        self.polar_value_combo.addItems(["height", "fwhm area"])
+        self.polar_value_combo.currentTextChanged.connect(self.on_polar_param_changed)
+        polar_layout.addWidget(self.polar_value_combo, row, 1)
+
+        row += 1
+        polar_layout.addWidget(QLabel("Beta (β):"), row, 0)
+        self.polar_beta_spin = QDoubleSpinBox()
+        self.polar_beta_spin.setRange(-2.0, 2.0)
+        self.polar_beta_spin.setSingleStep(0.1)
+        self.polar_beta_spin.setDecimals(4)
+        # Load default beta from config
+        calibrate_config = GlobalConfig.get_for_class('Calibrate')
+        default_beta = calibrate_config.get('beta', 2.0) if calibrate_config else 2.0
+        self.polar_beta_spin.setValue(default_beta)
+        self.polar_beta_spin.valueChanged.connect(self.on_polar_param_changed)
+        polar_layout.addWidget(self.polar_beta_spin, row, 1)
+
+        polar_group.setLayout(polar_layout)
+        layout.addWidget(polar_group)
+
+        # Control buttons
+        btn_group = QGroupBox("Control")
+        btn_layout = QVBoxLayout()
+
+        self.start_btn = QPushButton("Start Processing")
+        self.start_btn.clicked.connect(self.start_processing)
+        btn_layout.addWidget(self.start_btn)
+
+        self.stop_btn = QPushButton("Stop Processing")
+        self.stop_btn.clicked.connect(self.stop_processing)
+        self.stop_btn.setEnabled(False)
+        btn_layout.addWidget(self.stop_btn)
+
+        btn_group.setLayout(btn_layout)
+        layout.addWidget(btn_group)
+
+        # Detector selection
+        det_group = QGroupBox("Detector Selection")
+        det_outer_layout = QVBoxLayout()
+
+        det_btn_layout = QHBoxLayout()
+        self.select_all_btn = QPushButton("All")
+        self.select_all_btn.clicked.connect(self.select_all_detectors)
+        self.deselect_all_btn = QPushButton("None")
+        self.deselect_all_btn.clicked.connect(self.deselect_all_detectors)
+        det_btn_layout.addWidget(self.select_all_btn)
+        det_btn_layout.addWidget(self.deselect_all_btn)
+        det_outer_layout.addLayout(det_btn_layout)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setMaximumHeight(120)
+
+        self.det_checkbox_widget = QWidget()
+        self.det_checkbox_layout = QGridLayout(self.det_checkbox_widget)
+        self.det_checkbox_layout.setSpacing(2)
+
+        self.create_detector_checkboxes(16)
+
+        scroll_area.setWidget(self.det_checkbox_widget)
+        det_outer_layout.addWidget(scroll_area)
+
+        det_group.setLayout(det_outer_layout)
+        layout.addWidget(det_group)
+
+        # Performance display
+        perf_group = QGroupBox("Performance")
+        perf_layout = QVBoxLayout()
+
+        self.perf_text = QTextEdit()
+        self.perf_text.setReadOnly(True)
+        self.perf_text.setMaximumHeight(180)
+        font = QFont("Courier")
+        font.setPointSize(8)
+        self.perf_text.setFont(font)
+        perf_layout.addWidget(self.perf_text)
+
+        perf_group.setLayout(perf_layout)
+        layout.addWidget(perf_group)
+
+        layout.addStretch()
+
+        return panel
+
+    def create_detector_checkboxes(self, n_detectors):
+        """Create detector selection checkboxes"""
+        for cb in self.detector_checkboxes:
+            cb.deleteLater()
+        self.detector_checkboxes = []
+
+        n_cols = 4
+        for i in range(n_detectors):
+            cb = QCheckBox(f"D{i}")
+            cb.setChecked(i in self.enabled_detectors)
+            cb.stateChanged.connect(lambda state, det=i: self.on_detector_toggled(det, state))
+            self.det_checkbox_layout.addWidget(cb, i // n_cols, i % n_cols)
+            self.detector_checkboxes.append(cb)
+
+    def on_detector_toggled(self, detector_id, state):
+        if state:
+            self.enabled_detectors.add(detector_id)
+        else:
+            self.enabled_detectors.discard(detector_id)
+
+    def select_all_detectors(self):
+        for cb in self.detector_checkboxes:
+            cb.setChecked(True)
+
+    def deselect_all_detectors(self):
+        for cb in self.detector_checkboxes:
+            cb.setChecked(False)
+
+    def on_downsample_changed(self, value):
+        """Update downsample in plot worker"""
+        if self.plot_worker:
+            self.plot_worker.set_downsample(value)
+
+    def update_processing_config(self):
+        """Update processing config when spinbox values change (on Enter/focus loss)"""
+        if hasattr(self, 'processing_config'):
+            self.processing_config['threshold'] = self.threshold_spin.value()
+            self.processing_config['peakNo'] = self.peak_no_spin.value()
+            self.processing_config['roi'] = [self.roi_start_spin.value(), self.roi_end_spin.value()]
+            self.processing_config['smoothWindow'] = self.smooth_window_spin.value()
+
+            # Update plot worker ROI so plots show the limited range
+            if hasattr(self, 'plot_worker') and self.plot_worker:
+                self.plot_worker.set_roi(self.roi_start_spin.value(), self.roi_end_spin.value())
+
+            # Reset canvas background to force axis limits update on next plot
+            if hasattr(self, 'plot_canvas') and self.plot_canvas:
+                self.plot_canvas.background = None
+                # Force a redraw to update axis limits
+                for ax in self.plot_canvas.axes:
+                    ax.relim()
+                    ax.autoscale_view(scalex=True, scaley=False)
+                self.plot_canvas.draw_idle()
+
+            print(f"Config updated: threshold={self.processing_config['threshold']}, "
+                  f"peakNo={self.processing_config['peakNo']}, "
+                  f"roi={self.processing_config['roi']}, "
+                  f"smoothWindow={self.processing_config['smoothWindow']}")
+
+    def _on_source_mode_changed(self, checked):
+        self.file_source_widget.setVisible(self.file_mode_radio.isChecked())
+        self.doocs_source_widget.setVisible(self.doocs_mode_radio.isChecked())
+
+    def select_file(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder with .nxs Files")
+        if folder:
+            self.file_label.setText(folder)
+
+    def start_processing(self):
+        if self.file_mode_radio.isChecked():
+            if not self.file_label.text() or self.file_label.text() == "No folder selected":
+                self.file_label.setText("Please select a folder first!")
+                return
+            try:
+                self.data_simulator = DataStreamSimulator(Path(self.file_label.text()))
+                self.n_detectors = len(self.data_simulator.data.coords['detector'])
+            except Exception as e:
+                self.file_label.setText(f"Error: {e}")
+                return
+        else:
+            raw = self.doocs_addresses_edit.toPlainText().strip()
+            addresses = [a.strip() for a in raw.splitlines() if a.strip()]
+            if not addresses:
+                self.doocs_addresses_edit.setPlaceholderText("Enter at least one DOOCS address!")
+                return
+            try:
+                self.data_simulator = DoocspieStream(addresses)
+                self.n_detectors = len(self.data_simulator.data.coords['detector'])
+            except Exception as e:
+                print(f"DoocspieStream init error: {e}")
+                return
+
+        # Recreate canvas
+        self.recreate_canvas()
+
+        # Update detectors
+        self.enabled_detectors = set(range(self.n_detectors))
+        self.create_detector_checkboxes(self.n_detectors)
+
+        # Initialize buffer
+        self.circular_buffer = CircularBuffer(self.buffer_size_spin.value())
+
+        # Setup workers
+        self.setup_workers()
+
+        # Initialize canvas background for blitting
+        self.canvas.init_blit()
+
+        # Reset pipeline
+        self.stage_load = None
+        self.stage_process = None
+        self.stage_plot = None
+
+        # Start
+        self.running = True
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+
+        interval = int(1000 / self.update_rate_spin.value())
+        self.main_timer.start(interval)
+
+    def recreate_canvas(self):
+        """Recreate canvas with correct detector count"""
+        old_canvas = self.canvas
+
+        # Remove old canvas from tab widget
+        tab_index = self.tab_widget.indexOf(old_canvas)
+        if tab_index >= 0:
+            self.tab_widget.removeTab(tab_index)
+        old_canvas.deleteLater()
+
+        # Create new canvas and add back to tab widget at the same position
+        self.canvas = FastMplCanvas(self, width=10, height=8, dpi=100, n_detectors=self.n_detectors)
+        self.tab_widget.insertTab(0, self.canvas, "Plots")
+        self.tab_widget.setCurrentIndex(0)  # Make sure Plots tab is active
+
+    def setup_workers(self):
+        """Setup process pool and plotting workers"""
+        # Shutdown existing process pool
+        if self.process_pool:
+            self.process_pool.shutdown(wait=False)
+
+        if self.plot_worker:
+            self.plot_worker.stop()
+        if self.plot_thread:
+            self.plot_thread.join(timeout=1.0)
+
+        # Create process pool for parallel processing (bypasses GIL)
+        # Workers = (detectors / detectors_per_worker) * pipeline_depth
+        # This allows multiple processing batches to run simultaneously
+        det_per_worker = self.det_per_thread_spin.value()
+        pipeline_depth = self.pipeline_depth_spin.value()
+        n_workers_per_batch = int(np.ceil(self.n_detectors / det_per_worker))
+        n_workers_total = n_workers_per_batch * pipeline_depth
+
+        self.process_pool = ProcessPoolExecutor(max_workers=n_workers_total)
+
+        print(f"Process pool: {n_workers_per_batch} workers/batch × {pipeline_depth} batches = {n_workers_total} total workers")
+
+        # Store detector groupings for work distribution
+        self.detector_groups = []
+        for i in range(n_workers_per_batch):
+            start_det = i * det_per_worker
+            end_det = min((i + 1) * det_per_worker, self.n_detectors)
+            self.detector_groups.append(list(range(start_det, end_det)))
+
+        # Store config for workers - only override GUI-controlled parameters
+        # Other parameters (like stackTrains, stackPulses, etc.) come from config.yaml
+        self.processing_config = {
+            'threshold': self.threshold_spin.value(),
+            'peakNo': self.peak_no_spin.value(),
+            'roi': [self.roi_start_spin.value(), self.roi_end_spin.value()],
+            'smoothWindow': self.smooth_window_spin.value(),
+        }
+
+        # Create plot preparation worker (thread is fine for I/O-bound work)
+        self.plot_worker = PlotPreparationWorker(self.n_detectors)
+        self.plot_worker.set_downsample(self.downsample_spin.value())
+        self.plot_worker.set_roi(self.roi_start_spin.value(), self.roi_end_spin.value())
+        self.plot_worker.plot_ready.connect(self.on_plot_ready)
+
+        self.plot_thread = Thread(target=self.plot_worker.run, daemon=True)
+        self.plot_thread.start()
+
+    def main_loop_iteration(self):
+        """Main loop - staggered pipeline"""
+        iter_start = time.time()
+
+        # Stage 3: Trigger plot preparation (stage_plot has processed data)
+        if self.stage_plot is not None:
+            data = self.stage_plot.get('data')
+            normalized_data = self.stage_plot.get('normalized_data', {})
+            results = self.stage_plot.get('results')
+
+            if data is not None:
+                train_ids = data.indexes['pulse'].get_level_values('trainId')
+                pulse_ids = data.indexes['pulse'].get_level_values('pulseId')
+                last_train = train_ids[-1]
+                last_pulse = pulse_ids[-1]
+
+                # Store results for inspection in the Results tab
+                if results is not None and hasattr(results, 'empty'):
+                    self.last_results_df = results
+                    # Only update table if Results tab is currently visible
+                    if self.tab_widget.currentIndex() == 1:  # Results tab
+                        self.update_results_table()
+                    else:
+                        self.results_need_update = True  # Flag for later update
+
+                # Send to plot worker (non-blocking)
+                prep_start = time.time()
+                self.plot_worker.prepare(
+                    data, normalized_data, results,
+                    self.enabled_detectors.copy(),
+                    last_train, last_pulse
+                )
+                prep_time = time.time() - prep_start
+
+                if hasattr(self, '_last_plot_time'):
+                    plot_elapsed = time.time() - self._last_plot_time
+                    if plot_elapsed > 50:  # Only print if > 50ms
+                        print(f"Plot stage: {plot_elapsed*1000:.1f}ms (prep:{prep_time*1000:.1f}ms)")
+                self._last_plot_time = time.time()
+
+        # Check for completed processing futures from previous iteration
+        self.check_processing_futures()
+
+        # Only shift pipeline when processing is complete (results is a DataFrame, not a list)
+        # This ensures we have synchronized data + results for plotting
+        if self.stage_load is not None:
+            results = self.stage_load.get('results')
+            # Results starts as a list, becomes DataFrame when all futures complete
+            is_complete = not isinstance(results, list)
+            if is_complete:
+                self.stage_plot = self.stage_process
+                self.stage_process = self.stage_load
+                # Don't clear stage_load yet - let it be replaced by new load
+        else:
+            # No pending load, shift normally
+            self.stage_plot = self.stage_process
+            self.stage_process = None
+
+        # Stage 1: Load and submit to process pool
+        # Always load new data (don't wait for previous processing to complete)
+        # This enables true parallelism with multiple processing jobs in flight
+        load_start = time.time()
+        new_train = self.data_simulator.get_next_train()
+        if new_train is not None:
+            self.circular_buffer.push(new_train)
+
+            stacked_data = self.stack_buffer_data()
+            if stacked_data is not None:
+                # Normalize the data BEFORE chunking to ensure consistent scaling
+                # This way all detectors are normalized to the global maximum
+                norm_start = time.time()
+                data_max = stacked_data.max().values
+                if data_max > 0:
+                    stacked_data = stacked_data / data_max
+                norm_time = time.time() - norm_start
+
+                # Submit work to process pool
+                enabled_set = self.enabled_detectors.copy()
+                self.processing_futures = []
+
+                submit_start = time.time()
+                for i, detector_indices in enumerate(self.detector_groups):
+                    # Filter detector indices for this worker
+                    active_indices = [d for d in detector_indices if d in enabled_set]
+
+                    if active_indices:
+                        # Select this worker's detectors (xarray DataArrays are directly picklable)
+                        detector_data = stacked_data.sel(detector=active_indices)
+
+                        # Submit to process pool
+                        future = self.process_pool.submit(
+                            process_detector_chunk,
+                            (detector_data, self.processing_config, i)
+                        )
+                        self.processing_futures.append(future)
+
+                submit_time = time.time() - submit_start
+
+                self.stage_load = {
+                    'data': stacked_data,
+                    'results': [],
+                    'normalized_data': {},
+                    'worker_count': len(self.processing_futures),
+                    'finished_count': 0,
+                    'process_start_time': time.time(),
+                    'norm_time': norm_time,
+                    'submit_time': submit_time
+                }
+
+                # Record load cycle time
+                if hasattr(self, '_last_load_time'):
+                    load_cycle_time = time.time() - self._last_load_time
+                    self.performance_monitor.record_stage('load_cycle', load_cycle_time)
+                self._last_load_time = time.time()
+
+        self.performance_monitor.record_stage('load', time.time() - load_start)
+
+        self.performance_monitor.record_iteration(time.time() - iter_start)
+
+    def check_processing_futures(self):
+        """Check for completed processing futures and collect results"""
+        if not self.processing_futures or self.stage_load is None:
+            return
+
+        # Check each future
+        completed = []
+        for future in self.processing_futures:
+            if future.done():
+                completed.append(future)
+                try:
+                    worker_id, results, normalized_data = future.result()
+
+                    # Record timing
+                    self.performance_monitor.record_thread(worker_id, 0)
+
+                    # Store normalized data (already an xarray DataArray)
+                    if normalized_data is not None:
+                        self.stage_load['normalized_data'][worker_id] = normalized_data
+
+                    # Store results - peak positions are already in correct sample coordinates
+                    # (ROI is applied early in stack_buffer_data, and PeakFinder converts
+                    # array indices to actual sample coordinates)
+                    if results is not None and isinstance(self.stage_load['results'], list):
+                        self.stage_load['results'].append(results)
+
+                    self.stage_load['finished_count'] += 1
+
+                except Exception as e:
+                    print(f"Error collecting process result: {e}")
+                    self.stage_load['finished_count'] += 1
+
+        # Remove completed futures
+        for future in completed:
+            self.processing_futures.remove(future)
+
+        # Check if all workers finished
+        if self.stage_load['finished_count'] >= self.stage_load['worker_count']:
+            if 'process_start_time' in self.stage_load:
+                process_duration = time.time() - self.stage_load['process_start_time']
+                self.performance_monitor.record_stage('process', process_duration)
+
+            # Combine results
+            if isinstance(self.stage_load['results'], list) and self.stage_load['results']:
+                non_empty = [r for r in self.stage_load['results'] if not r.empty]
+                self.stage_load['results'] = pd.concat(non_empty, ignore_index=True) if non_empty else pd.DataFrame()
+            elif isinstance(self.stage_load['results'], list):
+                self.stage_load['results'] = pd.DataFrame()
+
+    def stack_buffer_data(self):
+        """Stack buffer data by concatenating trains along the pulse dimension.
+
+        Each train has dimensions (pulse, detector, sample). This method concatenates
+        all trains in the buffer along the pulse dimension, creating a larger dataset
+        that PeakFinder's .stack() method will then average.
+
+        The averaging is handled by PeakFinder.stack() based on stackTrains/stackPulses config.
+
+        Note: Returns data even if buffer isn't full yet (allows immediate processing).
+        ROI is applied here EARLY to reduce data size for all subsequent operations.
+        """
+        trains = self.circular_buffer.get_all()
+        if not trains:
+            return None
+
+        # Get ROI from processing config - apply it early for performance
+        roi = getattr(self, 'processing_config', {}).get('roi', [None, None])
+        roi_start = roi[0] if roi[0] is not None else None
+        roi_end = roi[1] if roi[1] is not None else None
+
+        # Apply ROI BEFORE computing to reduce data loaded from dask arrays
+        computed_trains = []
+        for train in trains:
+            # Apply ROI first (on dask array) - this makes compute() only load the ROI region
+            if roi_start is not None or roi_end is not None:
+                train = train.sel(sample=slice(roi_start, roi_end))
+
+            # Now compute (loads only the ROI region into memory)
+            if hasattr(train.data, 'compute'):
+                train_computed = train.compute()
+            else:
+                train_computed = train
+            computed_trains.append(train_computed)
+
+        if len(computed_trains) == 1:
+            return computed_trains[0]
+
+        # Concatenate all trains along the pulse dimension
+        # PeakFinder.stack() will handle the averaging
+        stacked = xr.concat(computed_trains, dim='pulse')
+        return stacked
+
+    @pyqtSlot(list)
+    def on_plot_ready(self, plot_data_list: List[PlotData]):
+        """Handle prepared plot data - update canvas (runs in GUI thread)"""
+        # Store plot data for later use
+        self.last_plot_data = plot_data_list
+
+        # Only update detector plots if Plots tab is visible
+        if self.tab_widget.currentIndex() == 0:  # Plots tab
+            render_start = time.time()
+            self.canvas.fast_update(plot_data_list)
+            self.performance_monitor.record_stage('plot_render', time.time() - render_start)
+        else:
+            self.plots_need_update = True
+
+        # Update polar plot if it's visible or flag for update
+        if self.tab_widget.currentIndex() == 2:  # Polarization tab
+            self.update_polar_plot()
+        else:
+            self.polar_needs_update = True
+
+    def on_tab_changed(self, index):
+        """Handle tab changes - update views when tabs are selected"""
+        if index == 0 and self.plots_need_update:  # Plots tab
+            if self.last_plot_data is not None:
+                self.canvas.fast_update(self.last_plot_data)
+            self.plots_need_update = False
+        elif index == 1 and self.results_need_update:  # Results tab
+            self.update_results_table()
+            self.results_need_update = False
+        elif index == 2 and self.polar_needs_update:  # Polarization tab
+            self.update_polar_plot()
+            self.polar_needs_update = False
+
+    def on_polar_param_changed(self):
+        """Handle changes to polar plot parameters"""
+        if self.tab_widget.currentIndex() == 2:
+            self.update_polar_plot()
+
+    def update_polar_plot(self):
+        """Update the polarization plot with current results"""
+        if self.last_results_df is None or self.last_results_df.empty:
+            return
+
+        peak_no = self.polar_peak_spin.value()
+        value_type = self.polar_value_combo.currentText()
+        beta = self.polar_beta_spin.value()
+
+        self.polar_canvas.update_polar_plot(
+            self.last_results_df,
+            peak_no=peak_no,
+            value_type=value_type,
+            beta=beta
+        )
+
+    def update_results_table(self):
+        """Update the results table with current results DataFrame"""
+        if self.last_results_df is None or self.last_results_df.empty:
+            self.results_table.setRowCount(0)
+            return
+
+        df = self.last_results_df
+        self.results_table.setRowCount(len(df))
+
+        # Column order matches the header
+        columns = ["detector", "trainId", "pulseId", "peakNo",
+                   "pos", "height", "width left", "width right", "fwhm area"]
+
+        for row_idx, (_, row) in enumerate(df.iterrows()):
+            for col_idx, col_name in enumerate(columns):
+                if col_name in df.columns:
+                    value = row[col_name]
+                    # Format floats nicely
+                    if isinstance(value, float):
+                        text = f"{value:.4f}"
+                    else:
+                        text = str(value)
+                    item = QTableWidgetItem(text)
+                    self.results_table.setItem(row_idx, col_idx, item)
+
+    def update_performance_display(self):
+        """Update performance display"""
+        stats = self.performance_monitor.get_stats()
+
+        text = "Performance Metrics:\n"
+        text += "=" * 40 + "\n"
+        text += f"Iteration (avg):   {stats['iteration_avg']*1000:.1f} ms\n"
+        text += f"Iteration (max):   {stats['iteration_max']*1000:.1f} ms\n"
+        text += f"Load cycle:        {stats['load_cycle_avg']*1000:.1f} ms\n"
+        text += f"Target:            {1000/self.update_rate_spin.value():.1f} ms\n"
+        text += "\n"
+        text += f"Load:              {stats['load_avg']*1000:.1f} ms\n"
+        text += f"Process:           {stats['process_avg']*1000:.1f} ms\n"
+        text += f"Plot prep:         {stats['plot_prep_avg']*1000:.1f} ms\n"
+        text += f"Plot render (GUI): {stats['plot_render_avg']*1000:.1f} ms\n"
+
+        self.perf_text.setPlainText(text)
+        # Scroll to top to keep display stable
+        self.perf_text.verticalScrollBar().setValue(0)
+
+    def stop_processing(self):
+        """Stop processing"""
+        self.running = False
+        self.main_timer.stop()
+
+        # Stop data stream (DoocspieStream has a stop(); DataStreamSimulator does not)
+        if self.data_simulator is not None and hasattr(self.data_simulator, 'stop'):
+            self.data_simulator.stop()
+
+        # Shutdown process pool
+        if self.process_pool:
+            self.process_pool.shutdown(wait=False)
+            self.process_pool = None
+
+        if self.plot_worker:
+            self.plot_worker.stop()
+        if self.plot_thread:
+            self.plot_thread.join(timeout=1.0)
+
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+
+    def closeEvent(self, event):
+        self.stop_processing()
+        event.accept()
