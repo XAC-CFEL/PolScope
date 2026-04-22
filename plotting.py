@@ -12,6 +12,10 @@ from colors import (COLOR_TRACE, COLOR_PEAK, COLOR_FWHM, COLOR_DATA,
                     COLOR_FIT, COLOR_PHI, COLOR_DISABLED, COLOR_GRAY)
 from models import PlotData
 
+_COLOR_BASELINE = '#228833'   # Tol green — dashed baseline endpoints
+_COLOR_ADJUSTED = '#228833'   # Tol green dotted — baseline-adjusted trace
+_MAX_BASELINE_PEAKS = 5       # max pre-created artists per detector
+
 
 class FastMplCanvas(FigureCanvasQTAgg):
     """Matplotlib canvas optimized for fast updates using blitting"""
@@ -45,7 +49,9 @@ class FastMplCanvas(FigureCanvasQTAgg):
         self.lines = []
         self.scatters = []
         self.text_objects = []
-        self.fwhm_lines = []  # LineCollection for FWHM horizontal lines
+        self.fwhm_lines = []      # LineCollection for FWHM horizontal lines
+        self.baseline_lcs = []    # LineCollection for baseline dashed segments
+        self.adjusted_lines = []  # List[List[Line2D]] for baseline-adjusted traces
 
         # Initialize plot objects
         for ax in self.axes:
@@ -65,6 +71,20 @@ class FastMplCanvas(FigureCanvasQTAgg):
             ax.add_collection(fwhm_lc)
             self.fwhm_lines.append(fwhm_lc)
 
+            # Baseline artists (green dashed segment between baseline endpoints)
+            baseline_lc = LineCollection([], colors=_COLOR_BASELINE, linewidths=1.2,
+                                          linestyles='dashed', zorder=3)
+            ax.add_collection(baseline_lc)
+            self.baseline_lcs.append(baseline_lc)
+
+            # Baseline-adjusted trace lines (one per possible peak)
+            adj_lines_for_det = []
+            for _ in range(_MAX_BASELINE_PEAKS):
+                adj_line, = ax.plot([], [], color=_COLOR_ADJUSTED, linestyle='dotted',
+                                    linewidth=1.0, alpha=0.7, zorder=3)
+                adj_lines_for_det.append(adj_line)
+            self.adjusted_lines.append(adj_lines_for_det)
+
         # Background for blitting
         self.background = None
 
@@ -81,7 +101,7 @@ class FastMplCanvas(FigureCanvasQTAgg):
         self.draw()
         self.background = self.copy_from_bbox(self.fig.bbox)
 
-    def fast_update(self, plot_data_list: List[PlotData]):
+    def fast_update(self, plot_data_list: List[PlotData], show_baseline: bool = True):
         """Fast update using blitting"""
         # First, update xlim for all axes that have data and check if any changed
         xlim_changed = False
@@ -110,6 +130,11 @@ class FastMplCanvas(FigureCanvasQTAgg):
                 scatter.set_offsets(np.empty((0, 2)))
             for fwhm_lc in self.fwhm_lines:
                 fwhm_lc.set_segments([])
+            for baseline_lc in self.baseline_lcs:
+                baseline_lc.set_segments([])
+            for adj_lines in self.adjusted_lines:
+                for al in adj_lines:
+                    al.set_data([], [])
             self.init_blit()
 
         # Restore background
@@ -125,6 +150,8 @@ class FastMplCanvas(FigureCanvasQTAgg):
             scatter = self.scatters[i]
             text = self.text_objects[i]
             fwhm_lc = self.fwhm_lines[i]
+            baseline_lc = self.baseline_lcs[i]
+            adj_lines = self.adjusted_lines[i]
 
             # Handle different states
             if not plot_data.has_data:
@@ -132,6 +159,9 @@ class FastMplCanvas(FigureCanvasQTAgg):
                 line.set_data([], [])
                 scatter.set_offsets(np.empty((0, 2)))
                 fwhm_lc.set_segments([])
+                baseline_lc.set_segments([])
+                for al in adj_lines:
+                    al.set_data([], [])
                 text.set_text('N/A')
                 text.set_color(COLOR_GRAY)
                 text.set_visible(True)
@@ -142,6 +172,9 @@ class FastMplCanvas(FigureCanvasQTAgg):
                 line.set_data([], [])
                 scatter.set_offsets(np.empty((0, 2)))
                 fwhm_lc.set_segments([])
+                baseline_lc.set_segments([])
+                for al in adj_lines:
+                    al.set_data([], [])
                 text.set_text('OFF')
                 text.set_color(COLOR_DISABLED)
                 text.set_visible(True)
@@ -180,10 +213,33 @@ class FastMplCanvas(FigureCanvasQTAgg):
                 else:
                     fwhm_lc.set_segments([])
 
+                # Update baseline / adjusted-trace artists
+                if show_baseline and plot_data.baseline_data:
+                    bl_segments = []
+                    for peak_idx, bd in enumerate(plot_data.baseline_data):
+                        # Dashed green segment connecting baseline endpoints
+                        bl_segments.append([(bd['bl_x'][0], bd['bl_y'][0]),
+                                             (bd['bl_x'][1], bd['bl_y'][1])])
+                        # Dotted adjusted trace
+                        if peak_idx < len(adj_lines):
+                            adj_lines[peak_idx].set_data(bd['adj_x'], bd['adj_y'])
+                    baseline_lc.set_segments(bl_segments)
+                    # Clear unused adjusted-trace lines
+                    n_peaks = len(plot_data.baseline_data)
+                    for k in range(n_peaks, len(adj_lines)):
+                        adj_lines[k].set_data([], [])
+                else:
+                    baseline_lc.set_segments([])
+                    for al in adj_lines:
+                        al.set_data([], [])
+
             # Redraw this axes
             ax.draw_artist(line)
             ax.draw_artist(scatter)
             ax.draw_artist(fwhm_lc)
+            ax.draw_artist(baseline_lc)
+            for al in adj_lines:
+                ax.draw_artist(al)
             ax.draw_artist(text)
 
         # Blit the updated region
@@ -387,3 +443,199 @@ class PolarPlotCanvas(FigureCanvasQTAgg):
         """Force a full redraw (needed when r-limits change significantly)"""
         self.draw()
         self.background = self.copy_from_bbox(self.fig.bbox)
+
+
+class AngularHeatmapCanvas(FigureCanvasQTAgg):
+    """Polar pcolormesh canvas showing intensity vs detector angle and sample position.
+
+    Uses the same interpolation logic as ``Plotter._buildIntensityGrid``.
+    Redraws fully each update (no blitting) — only active when its tab is shown.
+    """
+
+    def __init__(self, parent=None, width=7, height=7, dpi=100):
+        self.fig = Figure(figsize=(width, height), dpi=dpi)
+        # Polar axes + narrow colorbar axes with fixed width ratio
+        self.ax = self.fig.add_axes([0.05, 0.05, 0.78, 0.88], projection='polar')
+        self.cax = self.fig.add_axes([0.87, 0.15, 0.03, 0.65])  # fixed colorbar slot
+        self.ax.set_theta_zero_location('E')
+        self.ax.set_theta_direction(1)
+        self.ax.set_title('Angular Heatmap', fontsize=12)
+        super().__init__(self.fig)
+
+        # Detector-angle mapping from config (same source as PolarPlotCanvas)
+        nxs_config = GlobalConfig.get_for_class('NXSLoader')
+        self.angles_deg = np.array(
+            nxs_config.get('angles', np.linspace(0, 337.5, 16).tolist())
+            if nxs_config else np.linspace(0, 337.5, 16).tolist()
+        )
+        self.angles_rad = np.deg2rad(self.angles_deg)
+
+        self._colorbar = None
+        self._cbar_mappable = None
+
+    # ------------------------------------------------------------------
+    # Internal helpers (mirrors Plotter._buildIntensityGrid)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_intensity_grid(traces, angles_rad, n_theta=720):
+        """Interpolate *traces* (n_det × n_sample) onto a uniform theta grid.
+
+        Returns
+        -------
+        grid : ndarray, shape (n_theta, n_sample)
+        theta_grid : ndarray, shape (n_theta,)
+        """
+        n_samples = traces.shape[1]
+        theta_grid = np.linspace(0, 2 * np.pi, n_theta, endpoint=False)
+        grid = np.zeros((n_theta, n_samples))
+
+        sort_idx = np.argsort(angles_rad)
+        sorted_angles = angles_rad[sort_idx]
+        sorted_traces = traces[sort_idx]
+
+        for si in range(n_samples):
+            vals = sorted_traces[:, si]
+            xp_ext = np.concatenate(
+                [sorted_angles - 2 * np.pi, sorted_angles, sorted_angles + 2 * np.pi]
+            )
+            fp_ext = np.concatenate([vals, vals, vals])
+            grid[:, si] = np.interp(theta_grid, xp_ext, fp_ext)
+
+        return grid, theta_grid
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def update_heatmap(
+        self,
+        plot_data_list: List['PlotData'],
+        results_df,
+        sample_min: int,
+        sample_max: int,
+        interpolate: bool = True,
+        show_peaks: bool = True,
+    ):
+        """Rebuild the heatmap from current plot data and results.
+
+        Parameters
+        ----------
+        plot_data_list : list of PlotData
+            Plot-ready detector data (downsampled traces).
+        results_df : pandas.DataFrame or None
+            Peak-finding results (may be None / empty).
+        sample_min, sample_max : int
+            Displayed radial range (sample coordinates).
+        interpolate : bool
+            If True, smooth 720-point theta interpolation; else discrete wedges.
+        show_peaks : bool
+            Overlay peak scatter + width lines when True.
+        """
+        # Clear only the polar axes — cax (colorbar slot) keeps its position
+        self.ax.cla()
+        self.cax.cla()
+        self.ax.set_theta_zero_location('E')
+        self.ax.set_theta_direction(1)
+        self.ax.set_title('Angular Heatmap', fontsize=12)
+
+        # Collect enabled detectors that have data
+        det_ids = []
+        traces_list = []
+        sample_coords = None
+
+        for pd_obj in plot_data_list:
+            if not pd_obj.has_data or not pd_obj.is_enabled:
+                continue
+            if len(pd_obj.samples) == 0:
+                continue
+            det_id = pd_obj.detector_id
+            if det_id >= len(self.angles_deg):
+                continue
+
+            # Filter by sample range
+            smin_idx = int(np.searchsorted(pd_obj.samples, sample_min))
+            smax_idx = int(np.searchsorted(pd_obj.samples, sample_max, side='right'))
+            smin_idx = max(0, smin_idx)
+            smax_idx = min(len(pd_obj.samples), smax_idx)
+            if smax_idx <= smin_idx:
+                continue
+
+            trace_slice = pd_obj.values[smin_idx:smax_idx]
+            s_slice = pd_obj.samples[smin_idx:smax_idx]
+
+            det_ids.append(det_id)
+            traces_list.append(trace_slice)
+            if sample_coords is None or len(s_slice) > len(sample_coords):
+                sample_coords = s_slice
+
+        if not det_ids or sample_coords is None or len(sample_coords) == 0:
+            self.cax.set_visible(False)
+            self.draw_idle()
+            return
+        self.cax.set_visible(True)
+
+        # Align all traces to the common sample_coords length
+        n_samples = len(sample_coords)
+        traces = np.zeros((len(det_ids), n_samples))
+        for idx, t in enumerate(traces_list):
+            n = min(len(t), n_samples)
+            traces[idx, :n] = t[:n]
+
+        angles_rad = self.angles_rad[det_ids]
+
+        # Radius bin edges
+        if n_samples > 1:
+            dr = sample_coords[1] - sample_coords[0]
+        else:
+            dr = 1.0
+        r_edges = np.concatenate([[sample_coords[0] - dr / 2], sample_coords + dr / 2])
+
+        vmin = traces.min()
+        vmax = traces.max() if traces.max() > vmin else vmin + 1e-9
+
+        if interpolate:
+            grid, theta_grid = self._build_intensity_grid(traces, angles_rad, n_theta=720)
+            d_theta = theta_grid[1] - theta_grid[0]
+            theta_edges = np.append(theta_grid - d_theta / 2, theta_grid[-1] + d_theta / 2)
+            mesh = self.ax.pcolormesh(
+                theta_edges, r_edges, grid.T,
+                cmap='viridis', vmin=vmin, vmax=vmax, shading='auto',
+            )
+        else:
+            wedge_width = 2 * np.pi / 16
+            for idx in range(len(det_ids)):
+                ang = angles_rad[idx]
+                theta_edges = np.array([ang - wedge_width / 2, ang + wedge_width / 2])
+                C = traces[idx, :][np.newaxis, :]
+                self.ax.pcolormesh(
+                    theta_edges, r_edges, C.T,
+                    cmap='viridis', vmin=vmin, vmax=vmax, shading='auto',
+                )
+            mesh = self.ax.pcolormesh(
+                [0, 0.01], [r_edges[0], r_edges[-1]], [[vmin]],
+                cmap='viridis', vmin=vmin, vmax=vmax, shading='auto',
+            )
+            mesh.set_visible(False)
+
+        # Colourbar — drawn into the fixed cax slot, never touches self.ax geometry
+        self._colorbar = self.fig.colorbar(mesh, cax=self.cax, label='Intensity')
+
+        self.ax.set_rlim(r_edges[0], r_edges[-1])
+        self.ax.spines['polar'].set_visible(False)
+
+        # Peak overlay
+        if show_peaks and results_df is not None and not results_df.empty:
+            for _, peak_row in results_df.iterrows():
+                det = int(peak_row['detector'])
+                if det >= len(self.angles_rad):
+                    continue
+                ang = self.angles_rad[det]
+                pos = peak_row['pos']
+                wl = peak_row['width left']
+                wr = peak_row['width right']
+                self.ax.scatter([ang], [pos], color='red', s=20, zorder=6)
+                self.ax.plot([ang, ang], [pos + wl, pos + wr],
+                             color='red', linewidth=0.8, zorder=6)
+
+        self.draw_idle()

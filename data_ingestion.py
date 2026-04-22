@@ -176,11 +176,18 @@ class DoocspieStream:
 
     # ------------------------------------------------------------------
     def get_next_train(self):
-        """Non-blocking: return the next available train DataArray, or None."""
-        try:
-            return self._queue.get_nowait()
-        except Empty:
-            return None
+        """Non-blocking: drain the queue and return only the most recent train.
+
+        Older buffered trains are discarded so the caller always works on the
+        live edge of the stream rather than falling behind.
+        """
+        item = None
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except Empty:
+                break
+        return item
 
     def stop(self):
         """Signal the worker process to terminate and wait for it to exit."""

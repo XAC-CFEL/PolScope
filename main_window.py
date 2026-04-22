@@ -6,13 +6,18 @@ from pathlib import Path
 from threading import Thread
 from concurrent.futures import ProcessPoolExecutor
 from typing import List
+try:
+    import yaml as _yaml
+    _YAML_AVAILABLE = True
+except ImportError:
+    _YAML_AVAILABLE = False
 
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout,
                               QHBoxLayout, QLabel, QPushButton, QSpinBox,
                               QDoubleSpinBox, QGroupBox, QGridLayout, QFileDialog,
                               QTextEdit, QCheckBox, QScrollArea, QTabWidget,
                               QTableWidget, QTableWidgetItem, QHeaderView,
-                              QComboBox, QRadioButton)
+                              QComboBox, QRadioButton, QMessageBox)
 from PyQt6.QtCore import QTimer, pyqtSlot
 from PyQt6.QtGui import QFont
 
@@ -21,7 +26,7 @@ from ToFPipeline.ToFPipeline import GlobalConfig
 from models import PlotData
 from data_ingestion import CircularBuffer, DataStreamSimulator, DoocspieStream
 from processing import process_detector_chunk, PerformanceMonitor, PlotPreparationWorker
-from plotting import FastMplCanvas, PolarPlotCanvas
+from plotting import FastMplCanvas, PolarPlotCanvas, AngularHeatmapCanvas
 
 
 class MainWindow(QMainWindow):
@@ -57,6 +62,9 @@ class MainWindow(QMainWindow):
         self.stage_load = None
         self.stage_process = None
         self.stage_plot = None
+
+        # Intensity calibration coefficients (int det_id -> float coeff)
+        self.calib_coefficients = {}
 
         # Setup UI
         self.setup_ui()
@@ -101,6 +109,10 @@ class MainWindow(QMainWindow):
         self.polar_canvas = PolarPlotCanvas(self, width=6, height=6, dpi=100)
         self.tab_widget.addTab(self.polar_canvas, "Polarization")
 
+        # Tab 3: Angular Heatmap
+        self.heatmap_canvas = AngularHeatmapCanvas(self, width=7, height=7, dpi=100)
+        self.tab_widget.addTab(self.heatmap_canvas, "Angular Heatmap")
+
         # Connect tab change signal to update results when Results tab is selected
         self.tab_widget.currentChanged.connect(self.on_tab_changed)
 
@@ -115,6 +127,7 @@ class MainWindow(QMainWindow):
         self.results_need_update = False  # Flag to track if results need updating
         self.plots_need_update = False    # Flag for detector plots
         self.polar_needs_update = False   # Flag for polar plot updates
+        self.heatmap_needs_update = False  # Flag for angular heatmap updates
 
     def create_control_panel(self):
         """Create control panel"""
@@ -259,6 +272,12 @@ class MainWindow(QMainWindow):
         self.smooth_window_spin.editingFinished.connect(self.update_processing_config)
         param_layout.addWidget(self.smooth_window_spin, row, 1)
 
+        row += 1
+        self.show_baseline_check = QCheckBox("Show Baseline Adjusted")
+        self.show_baseline_check.setChecked(True)
+        self.show_baseline_check.stateChanged.connect(self.on_show_baseline_changed)
+        param_layout.addWidget(self.show_baseline_check, row, 0, 1, 2)
+
         param_group.setLayout(param_layout)
         layout.addWidget(param_group)
 
@@ -296,6 +315,60 @@ class MainWindow(QMainWindow):
 
         polar_group.setLayout(polar_layout)
         layout.addWidget(polar_group)
+
+        # Angular Heatmap Parameters
+        heatmap_group = QGroupBox("Angular Heatmap")
+        heatmap_layout = QGridLayout()
+
+        row = 0
+        heatmap_layout.addWidget(QLabel("Sample Min:"), row, 0)
+        self.heatmap_smin_spin = QSpinBox()
+        self.heatmap_smin_spin.setRange(0, 10000)
+        self.heatmap_smin_spin.setValue(0)
+        self.heatmap_smin_spin.valueChanged.connect(self.on_heatmap_param_changed)
+        heatmap_layout.addWidget(self.heatmap_smin_spin, row, 1)
+
+        row += 1
+        heatmap_layout.addWidget(QLabel("Sample Max:"), row, 0)
+        self.heatmap_smax_spin = QSpinBox()
+        self.heatmap_smax_spin.setRange(0, 10000)
+        self.heatmap_smax_spin.setValue(1000)
+        self.heatmap_smax_spin.valueChanged.connect(self.on_heatmap_param_changed)
+        heatmap_layout.addWidget(self.heatmap_smax_spin, row, 1)
+
+        row += 1
+        self.heatmap_interpolate_check = QCheckBox("Interpolate")
+        self.heatmap_interpolate_check.setChecked(True)
+        self.heatmap_interpolate_check.stateChanged.connect(self.on_heatmap_param_changed)
+        heatmap_layout.addWidget(self.heatmap_interpolate_check, row, 0, 1, 2)
+
+        row += 1
+        self.heatmap_showpeaks_check = QCheckBox("Show Peaks")
+        self.heatmap_showpeaks_check.setChecked(True)
+        self.heatmap_showpeaks_check.stateChanged.connect(self.on_heatmap_param_changed)
+        heatmap_layout.addWidget(self.heatmap_showpeaks_check, row, 0, 1, 2)
+
+        heatmap_group.setLayout(heatmap_layout)
+        layout.addWidget(heatmap_group)
+
+        # Calibration
+        calib_group = QGroupBox("Intensity Calibration")
+        calib_layout = QVBoxLayout()
+
+        calib_load_btn = QPushButton("Load calib.yaml")
+        calib_load_btn.clicked.connect(self.load_calibration_file)
+        calib_layout.addWidget(calib_load_btn)
+
+        self.calib_status_label = QLabel("No calibration loaded")
+        self.calib_status_label.setWordWrap(True)
+        calib_layout.addWidget(self.calib_status_label)
+
+        calib_clear_btn = QPushButton("Clear Calibration")
+        calib_clear_btn.clicked.connect(self.clear_calibration)
+        calib_layout.addWidget(calib_clear_btn)
+
+        calib_group.setLayout(calib_layout)
+        layout.addWidget(calib_group)
 
         # Control buttons
         btn_group = QGroupBox("Control")
@@ -604,15 +677,32 @@ class MainWindow(QMainWindow):
             self.stage_process = None
 
         # Stage 1: Load and submit to process pool
-        # Always load new data (don't wait for previous processing to complete)
-        # This enables true parallelism with multiple processing jobs in flight
+        # Always advance/drain the stream on every tick so we stay on the live
+        # edge (stale chunks are discarded).  Only feed the data into the
+        # pipeline when the previous batch has finished; otherwise we just drop
+        # the chunk and wait for the next tick.
         load_start = time.time()
-        new_train = self.data_simulator.get_next_train()
+        load_allowed = (self.stage_load is None) or (
+            not isinstance(self.stage_load.get('results'), list)
+        )
+        new_train = self.data_simulator.get_next_train()  # always drain/advance
+        if not load_allowed:
+            new_train = None  # pipeline still busy – skip this chunk
         if new_train is not None:
             self.circular_buffer.push(new_train)
 
             stacked_data = self.stack_buffer_data()
             if stacked_data is not None:
+                # Apply per-detector intensity calibration BEFORE normalization
+                # so relative detector weights influence the global scale
+                if self.calib_coefficients:
+                    det_coords = stacked_data.coords['detector'].values
+                    coeffs = np.array([self.calib_coefficients.get(int(d), 1.0)
+                                       for d in det_coords])
+                    calib_da = xr.DataArray(coeffs, coords=[stacked_data.coords['detector']],
+                                            dims=['detector'])
+                    stacked_data = stacked_data * calib_da
+
                 # Normalize the data BEFORE chunking to ensure consistent scaling
                 # This way all detectors are normalized to the global maximum
                 norm_start = time.time()
@@ -765,7 +855,8 @@ class MainWindow(QMainWindow):
         # Only update detector plots if Plots tab is visible
         if self.tab_widget.currentIndex() == 0:  # Plots tab
             render_start = time.time()
-            self.canvas.fast_update(plot_data_list)
+            self.canvas.fast_update(plot_data_list,
+                                    show_baseline=self.show_baseline_check.isChecked())
             self.performance_monitor.record_stage('plot_render', time.time() - render_start)
         else:
             self.plots_need_update = True
@@ -776,11 +867,18 @@ class MainWindow(QMainWindow):
         else:
             self.polar_needs_update = True
 
+        # Update heatmap if it's visible or flag for update
+        if self.tab_widget.currentIndex() == 3:  # Angular Heatmap tab
+            self.update_heatmap_plot()
+        else:
+            self.heatmap_needs_update = True
+
     def on_tab_changed(self, index):
         """Handle tab changes - update views when tabs are selected"""
         if index == 0 and self.plots_need_update:  # Plots tab
             if self.last_plot_data is not None:
-                self.canvas.fast_update(self.last_plot_data)
+                self.canvas.fast_update(self.last_plot_data,
+                                        show_baseline=self.show_baseline_check.isChecked())
             self.plots_need_update = False
         elif index == 1 and self.results_need_update:  # Results tab
             self.update_results_table()
@@ -788,11 +886,70 @@ class MainWindow(QMainWindow):
         elif index == 2 and self.polar_needs_update:  # Polarization tab
             self.update_polar_plot()
             self.polar_needs_update = False
+        elif index == 3 and self.heatmap_needs_update:  # Angular Heatmap tab
+            self.update_heatmap_plot()
+            self.heatmap_needs_update = False
 
     def on_polar_param_changed(self):
         """Handle changes to polar plot parameters"""
         if self.tab_widget.currentIndex() == 2:
             self.update_polar_plot()
+
+    def on_show_baseline_changed(self, state):
+        """Re-render Plots tab immediately when baseline toggle changes"""
+        if self.last_plot_data is not None and self.tab_widget.currentIndex() == 0:
+            self.canvas.background = None  # Force full redraw so artists are registered
+            self.canvas.fast_update(self.last_plot_data, show_baseline=bool(state))
+
+    def on_heatmap_param_changed(self):
+        """Update heatmap when controls change"""
+        if self.tab_widget.currentIndex() == 3:
+            self.update_heatmap_plot()
+
+    def update_heatmap_plot(self):
+        """Rebuild the angular heatmap with current plot data and results"""
+        if self.last_plot_data is None:
+            return
+        self.heatmap_canvas.update_heatmap(
+            self.last_plot_data,
+            self.last_results_df,
+            sample_min=self.heatmap_smin_spin.value(),
+            sample_max=self.heatmap_smax_spin.value(),
+            interpolate=self.heatmap_interpolate_check.isChecked(),
+            show_peaks=self.heatmap_showpeaks_check.isChecked(),
+        )
+
+    def load_calibration_file(self):
+        """Open a calib.yaml and load per-detector transmission coefficients"""
+        if not _YAML_AVAILABLE:
+            QMessageBox.critical(self, "Missing dependency",
+                                 "PyYAML is not installed. Run: pip install pyyaml")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select calibration file", "",
+            "YAML files (*.yaml *.yml);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, 'r') as fh:
+                data = _yaml.safe_load(fh)
+            if not isinstance(data, dict) or 'detectors' not in data:
+                raise ValueError("calib.yaml must contain a 'detectors' mapping")
+            raw = data['detectors']
+            if not isinstance(raw, dict):
+                raise ValueError("'detectors' must be a mapping of detector_id: coefficient")
+            self.calib_coefficients = {int(k): float(v) for k, v in raw.items()}
+            n = len(self.calib_coefficients)
+            self.calib_status_label.setText(f"Loaded {n} detector(s)\n{Path(path).name}")
+        except Exception as e:
+            QMessageBox.warning(self, "Calibration load error", str(e))
+            self.calib_status_label.setText("Load failed — see console")
+
+    def clear_calibration(self):
+        """Remove loaded calibration coefficients"""
+        self.calib_coefficients = {}
+        self.calib_status_label.setText("No calibration loaded")
 
     def update_polar_plot(self):
         """Update the polarization plot with current results"""

@@ -1,3 +1,4 @@
+import math
 import numpy as np
 import traceback
 from collections import deque
@@ -201,15 +202,19 @@ class PlotPreparationWorker(QObject):
                             ))
                             continue
 
-                        # Downsample the smoothed trace
-                        # Note: smoothing already trimmed sample coordinates, so they match peak positions
-                        samples = trace['sample'].values[::self.downsample]
-                        values = trace.values[::self.downsample]
+                        # Full-resolution arrays (used for baseline computation)
+                        samples_all = trace['sample'].values
+                        values_all = trace.values
+
+                        # Downsampled arrays (used for display)
+                        samples = samples_all[::self.downsample]
+                        values = values_all[::self.downsample]
 
                         # Get peaks - filter only by detector (independent per detector)
                         # For averaged/rolling buffer data, we don't filter by trainId/pulseId
                         peak_positions = None
                         fwhm_lines = None
+                        baseline_data = None
                         if results is not None and hasattr(results, 'empty') and not results.empty:
                             peaks = results[results['detector'] == det_id]
                             if not peaks.empty:
@@ -218,6 +223,41 @@ class PlotPreparationWorker(QObject):
                                 fwhm_lines = peaks[['pos', 'width left', 'width right', 'height']].values.copy()
                                 fwhm_lines[:, 3] = fwhm_lines[:, 3] / 2  # Convert height to half height
 
+                                # Build per-peak baseline data when available
+                                if 'baseline left' in peaks.columns and 'baseline right' in peaks.columns:
+                                    baseline_data = []
+                                    for _, peak_row in peaks.iterrows():
+                                        bl = peak_row['baseline left']
+                                        br = peak_row['baseline right']
+                                        # Skip invalid baseline values
+                                        if bl is False or br is False:
+                                            continue
+                                        try:
+                                            if math.isnan(float(bl)) or math.isnan(float(br)):
+                                                continue
+                                        except (TypeError, ValueError):
+                                            continue
+                                        bl_idx = int(np.searchsorted(samples_all, float(bl)))
+                                        br_idx = int(np.searchsorted(samples_all, float(br), side='right')) - 1
+                                        bl_idx = max(0, min(bl_idx, len(samples_all) - 1))
+                                        br_idx = max(0, min(br_idx, len(samples_all) - 1))
+                                        if br_idx <= bl_idx:
+                                            continue
+                                        yL = float(values_all[bl_idx])
+                                        yR = float(values_all[br_idx])
+                                        xL = float(samples_all[bl_idx])
+                                        xR = float(samples_all[br_idx])
+                                        slope = (yR - yL) / (xR - xL) if xR != xL else 0.0
+                                        offset = yL - slope * xL
+                                        adj_x = samples_all[bl_idx:br_idx + 1]
+                                        adj_y = values_all[bl_idx:br_idx + 1] - (slope * adj_x + offset)
+                                        baseline_data.append({
+                                            'bl_x': [xL, xR],
+                                            'bl_y': [yL, yR],
+                                            'adj_x': adj_x.copy(),
+                                            'adj_y': adj_y.copy(),
+                                        })
+
                         plot_data_list.append(PlotData(
                             detector_id=i,
                             samples=samples,
@@ -225,7 +265,8 @@ class PlotPreparationWorker(QObject):
                             peak_positions=peak_positions,
                             fwhm_lines=fwhm_lines,
                             is_enabled=True,
-                            has_data=True
+                            has_data=True,
+                            baseline_data=baseline_data,
                         ))
 
                     except Exception as e:
