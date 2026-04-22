@@ -6,7 +6,7 @@ from pathlib import Path
 from multiprocessing import Process, Queue, Lock, Event
 from multiprocessing.queues import Empty
 
-from ToFPipeline.ToFPipeline import NXSLoader
+from ToFPipeline.ToFPipeline import NXSLoader, GlobalConfig
 
 
 # ---------------------------------------------------------------------------
@@ -14,7 +14,7 @@ from ToFPipeline.ToFPipeline import NXSLoader
 # can pickle them when starting the worker process on Windows.
 # ---------------------------------------------------------------------------
 
-def _convert_train_event(train_event, addresses: list) -> xr.DataArray:
+def _convert_train_event(train_event, addresses: list, baseline_region=None) -> xr.DataArray:
     """Convert a doocspie TrainEvent to an xr.DataArray."""
     train_id = train_event.id
     n_detectors = len(addresses)
@@ -35,6 +35,11 @@ def _convert_train_event(train_event, addresses: list) -> xr.DataArray:
 
     stacked = np.stack(detector_arrays, axis=0)  # (n_detectors, n_pulses, n_samples)
 
+    if baseline_region is not None:
+        b0, b1 = baseline_region
+        baseline = stacked[..., b0:b1].mean(axis=-1, keepdims=True)
+        stacked = stacked - baseline
+
     pulse_index = pd.MultiIndex.from_arrays(
         [[train_id] * n_pulses, list(range(n_pulses))],
         names=['trainId', 'pulseId'],
@@ -51,7 +56,7 @@ def _convert_train_event(train_event, addresses: list) -> xr.DataArray:
     )
 
 
-def _doocspie_worker(addresses, timeout_seconds, queue, stop_event):
+def _doocspie_worker(addresses, timeout_seconds, queue, stop_event, baseline_region=None):
     """Worker process: blocks on successive trains and enqueues DataArrays."""
     from doocspie.abo import TrainAbo
 
@@ -63,7 +68,7 @@ def _doocspie_worker(addresses, timeout_seconds, queue, stop_event):
         if stop_event.is_set():
             break
         try:
-            da = _convert_train_event(train_event, addresses)
+            da = _convert_train_event(train_event, addresses, baseline_region=baseline_region)
             if queue.full():
                 try:
                     queue.get_nowait()
@@ -109,6 +114,7 @@ class DataStreamSimulator:
     def __init__(self, nxs_path, run_numbers=None):
         self.loader = NXSLoader(nxs_path, run_numbers)
         self.loader.load()
+        self.loader.defaultPreprocessing()
         self.data = self.loader.data
 
         # Group by train
@@ -169,11 +175,14 @@ class DoocspieStream:
         # Expose .data so MainWindow can call len(stream.data.coords['detector'])
         self.data = _DataProxy(self.n_detectors)
 
+        doocs_cfg = GlobalConfig.get_for_class('DoocspieStream')
+        self._baseline_region = doocs_cfg.get('baselineRegion', None)
+
         self._queue: Queue = Queue(maxsize=4)
         self._stop_event = Event()
         self._process = Process(
             target=_doocspie_worker,
-            args=(self._addresses, timeout_seconds, self._queue, self._stop_event),
+            args=(self._addresses, timeout_seconds, self._queue, self._stop_event, self._baseline_region),
             daemon=True,
         )
         self._process.start()
