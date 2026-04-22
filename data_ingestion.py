@@ -1,6 +1,7 @@
 import numpy as np
 import xarray as xr
 import pandas as pd
+import traceback
 from pathlib import Path
 from multiprocessing import Process, Queue, Lock, Event
 from multiprocessing.queues import Empty
@@ -23,6 +24,8 @@ def _convert_train_event(train_event, addresses: list) -> xr.DataArray:
 
     for i, addr in enumerate(addresses):
         readout = train_event.get(addr)
+        if readout is None or readout.data is None:
+            raise ValueError(f"No data for address '{addr}' (detector {i})")
         arr = np.asarray(readout.data, dtype=np.float64)
         if arr.ndim == 1:
             arr = arr[np.newaxis, :]   # (1, n_samples)
@@ -69,6 +72,7 @@ def _doocspie_worker(addresses, timeout_seconds, queue, stop_event):
             queue.put_nowait(da)
         except Exception as e:
             print(f"DoocspieStream conversion error: {e}")
+            traceback.print_exc()
 
 
 class CircularBuffer:
