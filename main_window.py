@@ -234,7 +234,15 @@ class MainWindow(QMainWindow):
         self.buffer_size_spin = QSpinBox()
         self.buffer_size_spin.setRange(1, 100)
         self.buffer_size_spin.setValue(1)
+        self.buffer_size_spin.setEnabled(False)
+        self.buffer_size_spin.valueChanged.connect(self.on_buffer_size_changed)
         param_layout.addWidget(self.buffer_size_spin, row, 1)
+
+        row += 1
+        self.buffer_enable_check = QCheckBox("Enable Buffer")
+        self.buffer_enable_check.setChecked(False)
+        self.buffer_enable_check.stateChanged.connect(self.on_buffer_enable_changed)
+        param_layout.addWidget(self.buffer_enable_check, row, 0, 1, 2)
 
         row += 1
         param_layout.addWidget(QLabel("Detectors/Thread:"), row, 0)
@@ -507,6 +515,23 @@ class MainWindow(QMainWindow):
         if self.plot_worker:
             self.plot_worker.set_downsample(value)
 
+    def on_buffer_enable_changed(self, state):
+        """Enable/disable buffer; unchecked forces buffer size to 1."""
+        enabled = bool(state)
+        self.buffer_size_spin.setEnabled(enabled)
+        effective_size = self.buffer_size_spin.value() if enabled else 1
+        if self.circular_buffer is not None:
+            self.circular_buffer.resize(effective_size)
+        print(f"Buffer {'enabled' if enabled else 'disabled'}: effective size={effective_size}")
+
+    def on_buffer_size_changed(self, value):
+        """Resize the circular buffer live when the spinbox changes."""
+        if not self.buffer_enable_check.isChecked():
+            return
+        if self.circular_buffer is not None:
+            self.circular_buffer.resize(value)
+        print(f"Buffer resized to {value}")
+
     def update_processing_config(self):
         """Update processing config when spinbox values change (on Enter/focus loss)"""
         if hasattr(self, 'processing_config'):
@@ -584,8 +609,9 @@ class MainWindow(QMainWindow):
         self.enabled_detectors = set(range(self.n_detectors))
         self.create_detector_checkboxes(self.n_detectors)
 
-        # Initialize buffer
-        self.circular_buffer = CircularBuffer(self.buffer_size_spin.value())
+        # Initialize buffer (size=1 when buffer is disabled)
+        effective_buf_size = self.buffer_size_spin.value() if self.buffer_enable_check.isChecked() else 1
+        self.circular_buffer = CircularBuffer(effective_buf_size)
 
         # Setup workers
         self.setup_workers()

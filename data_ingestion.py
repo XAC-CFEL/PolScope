@@ -103,6 +103,13 @@ class CircularBuffer:
         with self.lock:
             return len(self._buffer)
 
+    def resize(self, new_size):
+        with self.lock:
+            self.size = max(1, new_size)
+            # Trim oldest entries if buffer exceeds new size
+            while len(self._buffer) > self.size:
+                self._buffer.pop(0)
+
     def clear(self):
         with self.lock:
             self._buffer.clear()
