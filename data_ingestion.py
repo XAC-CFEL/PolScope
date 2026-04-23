@@ -33,7 +33,7 @@ def _convert_train_event(train_event, addresses: list, baseline_region=None) -> 
             n_pulses, n_samples = arr.shape
         detector_arrays.append(arr)
 
-    stacked = np.stack(detector_arrays, axis=0)  # (n_detectors, n_pulses, n_samples)
+    stacked = -np.stack(detector_arrays, axis=0)  # (n_detectors, n_pulses, n_samples)
 
     if baseline_region is not None:
         b0, b1 = baseline_region
