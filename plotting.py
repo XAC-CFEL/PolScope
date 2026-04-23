@@ -413,37 +413,60 @@ class PolarPlotCanvas(FigureCanvasQTAgg):
 
         self._redraw_artists()
 
-    def _fit_and_plot(self, theta, r_values, beta, r_max, setPlin=None, fitBeta=False):
+    def _fit_and_plot(self, theta, r_values, beta, r_max, setPlin=None, fitBeta=False, setPhi=None, fitPhi=True):
         """Fit the polarization model and update plot"""
         fit_kws = dict(method='trf', ftol=1e-10, xtol=1e-10, gtol=1e-10, maxfev=5000)
         scale_guess = np.mean(r_values)
         beta0 = beta if beta != 0 else 1.0
+        phi0 = setPhi if setPhi is not None else 0.0
 
         if fitBeta:
-            # Plin is fixed; fit phi, beta2, scale
+            # Plin is fixed
             plin_val = setPlin if setPlin is not None else 1.0
-            def model(theta, phi, beta2, scale):
-                return polarization_model(theta, Plin=plin_val, phi=phi, beta2=beta2, scale=scale)
-            initial_guess = [0.0, beta0, scale_guess]
-            bounds = ([-np.pi, -4.0, 0], [np.pi, 4.0, np.inf])
-            popt, pcov = curve_fit(model, theta, r_values, p0=initial_guess, bounds=bounds, **fit_kws)
-            phi_fit, beta2_fit, scale_fit = popt
+            plin_label = f"Plin: {plin_val:.4f} (fixed)"
+            if fitPhi:
+                # fit phi, beta2, scale
+                def model(theta, phi, beta2, scale):
+                    return polarization_model(theta, Plin=plin_val, phi=phi, beta2=beta2, scale=scale)
+                initial_guess = [phi0, beta0, scale_guess]
+                bounds = ([-np.pi, -4.0, 0], [np.pi, 4.0, np.inf])
+                popt, pcov = curve_fit(model, theta, r_values, p0=initial_guess, bounds=bounds, **fit_kws)
+                phi_fit, beta2_fit, scale_fit = popt
+            else:
+                # phi fixed; fit beta2, scale
+                phi_fixed = setPhi if setPhi is not None else 0.0
+                def model(theta, beta2, scale):
+                    return polarization_model(theta, Plin=plin_val, phi=phi_fixed, beta2=beta2, scale=scale)
+                initial_guess = [beta0, scale_guess]
+                bounds = ([-4.0, 0], [4.0, np.inf])
+                popt, pcov = curve_fit(model, theta, r_values, p0=initial_guess, bounds=bounds, **fit_kws)
+                beta2_fit, scale_fit = popt
+                phi_fit = phi_fixed
             Plin_fit = plin_val
-            beta_display = beta2_fit
-            plin_label = f"Plin: {Plin_fit:.4f} (fixed)"
             beta_label = f"β: {beta2_fit:.4f} (fitted)"
         else:
-            # Fit Plin, phi, scale; beta fixed
-            def model(theta, Plin, phi, scale):
-                return polarization_model(theta, Plin=Plin, phi=phi, beta2=beta, scale=scale)
-            initial_guess = [0.2, 0.0, scale_guess]
-            bounds = ([0.0, -np.pi, 0], [2.0, np.pi, np.inf])
-            popt, pcov = curve_fit(model, theta, r_values, p0=initial_guess, bounds=bounds, **fit_kws)
-            Plin_fit, phi_fit, scale_fit = popt
+            # beta fixed
             beta2_fit = beta
-            beta_display = beta
-            plin_label = f"Plin: {Plin_fit:.4f}"
             beta_label = f"β: {beta:.3f} (fixed)"
+            if fitPhi:
+                # fit Plin, phi, scale
+                def model(theta, Plin, phi, scale):
+                    return polarization_model(theta, Plin=Plin, phi=phi, beta2=beta, scale=scale)
+                initial_guess = [0.2, phi0, scale_guess]
+                bounds = ([0.0, -np.pi, 0], [2.0, np.pi, np.inf])
+                popt, pcov = curve_fit(model, theta, r_values, p0=initial_guess, bounds=bounds, **fit_kws)
+                Plin_fit, phi_fit, scale_fit = popt
+            else:
+                # phi fixed; fit Plin, scale
+                phi_fixed = setPhi if setPhi is not None else 0.0
+                def model(theta, Plin, scale):
+                    return polarization_model(theta, Plin=Plin, phi=phi_fixed, beta2=beta, scale=scale)
+                initial_guess = [0.2, scale_guess]
+                bounds = ([0.0, 0], [2.0, np.inf])
+                popt, pcov = curve_fit(model, theta, r_values, p0=initial_guess, bounds=bounds, **fit_kws)
+                Plin_fit, scale_fit = popt
+                phi_fit = phi_fixed
+            plin_label = f"Plin: {Plin_fit:.4f}"
 
         self.last_fit_params = {
             'Plin': Plin_fit,
