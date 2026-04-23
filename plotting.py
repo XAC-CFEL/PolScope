@@ -653,10 +653,23 @@ class AngularHeatmapCanvas(FigureCanvasQTAgg):
                 cmap='viridis', vmin=vmin, vmax=vmax, shading='auto',
             )
         else:
-            wedge_width = 2 * np.pi / 16
+            # Compute per-detector wedge half-widths as half the gap to each neighbour
+            n_dets = len(angles_rad)
+            if n_dets > 1:
+                sorted_idx = np.argsort(angles_rad)
+                sorted_ang = angles_rad[sorted_idx]
+                gaps = np.diff(sorted_ang, append=sorted_ang[0] + 2 * np.pi)
+                left_half = np.roll(gaps, 1) / 2
+                right_half = gaps / 2
+                inv_idx = np.argsort(sorted_idx)
+                wedge_left = left_half[inv_idx]
+                wedge_right = right_half[inv_idx]
+            else:
+                wedge_left = np.array([np.pi])
+                wedge_right = np.array([np.pi])
             for idx in range(len(det_ids)):
                 ang = angles_rad[idx]
-                theta_edges = np.array([ang - wedge_width / 2, ang + wedge_width / 2])
+                theta_edges = np.array([ang - wedge_left[idx], ang + wedge_right[idx]])
                 C = traces[idx, :][np.newaxis, :]
                 self.ax.pcolormesh(
                     theta_edges, r_edges, C.T,
