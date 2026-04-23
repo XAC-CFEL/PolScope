@@ -318,6 +318,13 @@ class MainWindow(QMainWindow):
         param_layout.addWidget(self.smooth_window_spin, row, 1)
 
         row += 1
+        self.normalize_check = QCheckBox("Normalize Data")
+        self.normalize_check.setChecked(True)
+        self.normalize_check.setToolTip("Divide data by global maximum before processing")
+        self.normalize_check.stateChanged.connect(lambda _: self.update_processing_config())
+        param_layout.addWidget(self.normalize_check, row, 0, 1, 2)
+
+        row += 1
         self.show_baseline_check = QCheckBox("Show Baseline Adjusted")
         self.show_baseline_check.setChecked(True)
         self.show_baseline_check.stateChanged.connect(self.on_show_baseline_changed)
@@ -798,9 +805,10 @@ class MainWindow(QMainWindow):
                 # Normalize the data BEFORE chunking to ensure consistent scaling
                 # This way all detectors are normalized to the global maximum
                 norm_start = time.time()
-                data_max = stacked_data.max().values
-                if data_max > 0:
-                    stacked_data = stacked_data / data_max
+                if self.normalize_check.isChecked():
+                    data_max = stacked_data.max().values
+                    if data_max > 0:
+                        stacked_data = stacked_data / data_max
                 norm_time = time.time() - norm_start
 
                 # Submit work to process pool
