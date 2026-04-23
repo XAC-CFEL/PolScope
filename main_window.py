@@ -264,6 +264,7 @@ class MainWindow(QMainWindow):
         self.update_rate_spin = QSpinBox()
         self.update_rate_spin.setRange(1, 50)
         self.update_rate_spin.setValue(10)
+        self.update_rate_spin.valueChanged.connect(self.on_update_rate_changed)
         param_layout.addWidget(self.update_rate_spin, row, 1)
 
         row += 1
@@ -514,6 +515,11 @@ class MainWindow(QMainWindow):
         """Update downsample in plot worker"""
         if self.plot_worker:
             self.plot_worker.set_downsample(value)
+
+    def on_update_rate_changed(self, value):
+        """Restart the main timer with the new interval when the rate changes live."""
+        if self.running and self.main_timer.isActive():
+            self.main_timer.setInterval(int(1000 / value))
 
     def on_buffer_enable_changed(self, state):
         """Enable/disable buffer; unchecked forces buffer size to 1."""
