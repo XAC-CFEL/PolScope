@@ -272,7 +272,7 @@ class MainWindow(QMainWindow):
         self.threshold_spin.setRange(0, 1)
         self.threshold_spin.setSingleStep(0.01)
         self.threshold_spin.setValue(0.1)
-        self.threshold_spin.editingFinished.connect(self.update_processing_config)
+        self.threshold_spin.valueChanged.connect(lambda _: self.update_processing_config())
         param_layout.addWidget(self.threshold_spin, row, 1)
 
         row += 1
@@ -280,7 +280,7 @@ class MainWindow(QMainWindow):
         self.peak_no_spin = QSpinBox()
         self.peak_no_spin.setRange(1, 20)
         self.peak_no_spin.setValue(1)
-        self.peak_no_spin.editingFinished.connect(self.update_processing_config)
+        self.peak_no_spin.valueChanged.connect(lambda _: self.update_processing_config())
         param_layout.addWidget(self.peak_no_spin, row, 1)
 
         row += 1
@@ -305,7 +305,7 @@ class MainWindow(QMainWindow):
         self.smooth_window_spin.setRange(1, 50)
         self.smooth_window_spin.setValue(5)
         self.smooth_window_spin.setToolTip("Window size for rolling average smoothing (1 = no smoothing)")
-        self.smooth_window_spin.editingFinished.connect(self.update_processing_config)
+        self.smooth_window_spin.valueChanged.connect(lambda _: self.update_processing_config())
         param_layout.addWidget(self.smooth_window_spin, row, 1)
 
         row += 1
@@ -511,7 +511,7 @@ class MainWindow(QMainWindow):
         """Update processing config when spinbox values change (on Enter/focus loss)"""
         if hasattr(self, 'processing_config'):
             self.processing_config['threshold'] = self.threshold_spin.value()
-            self.processing_config['peakNo'] = self.peak_no_spin.value()
+            self.processing_config['peakNo'] = self.peak_no_spin.value()-1  # zero-index internally
             self.processing_config['roi'] = [self.roi_start_spin.value(), self.roi_end_spin.value()]
             self.processing_config['smoothWindow'] = self.smooth_window_spin.value()
 
@@ -565,6 +565,17 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 print(f"DoocspieStream init error: {e}")
                 return
+
+            # Apply angles from DoocspieStream config to the polar / heatmap canvases
+            doocs_cfg = GlobalConfig.get_for_class('DoocspieStream')
+            if doocs_cfg and 'angles' in doocs_cfg:
+                angles_cfg = doocs_cfg['angles']
+                if isinstance(angles_cfg, dict):
+                    angles_list = [angles_cfg[k] for k in sorted(angles_cfg)]
+                else:
+                    angles_list = list(angles_cfg)
+                self.polar_canvas.set_angles(angles_list)
+                self.heatmap_canvas.set_angles(angles_list)
 
         # Recreate canvas
         self.recreate_canvas()
