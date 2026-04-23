@@ -14,7 +14,21 @@ from ToFPipeline.ToFPipeline import NXSLoader, GlobalConfig
 # can pickle them when starting the worker process on Windows.
 # ---------------------------------------------------------------------------
 
-def _convert_train_event(train_event, addresses: list, baseline_region=None) -> xr.DataArray:
+def _apply_shift_numpy(arr, n):
+    """Shift array along last axis by n samples with zero-padding."""
+    n = int(n)
+    if n == 0:
+        return arr
+    n_samples = arr.shape[-1]
+    if n > 0:
+        pad = np.zeros(arr.shape[:-1] + (n,), dtype=arr.dtype)
+        return np.concatenate([pad, arr[..., :n_samples - n]], axis=-1)
+    else:
+        pad = np.zeros(arr.shape[:-1] + (-n,), dtype=arr.dtype)
+        return np.concatenate([arr[..., -n:], pad], axis=-1)
+
+
+def _convert_train_event(train_event, addresses: list, baseline_region=None, shift=None) -> xr.DataArray:
     """Convert a doocspie TrainEvent to an xr.DataArray."""
     train_id = train_event.id
     n_detectors = len(addresses)
@@ -40,6 +54,13 @@ def _convert_train_event(train_event, addresses: list, baseline_region=None) -> 
         baseline = stacked[..., b0:b1].mean(axis=-1, keepdims=True)
         stacked = stacked - baseline
 
+    if shift:
+        shift_map = {int(k): int(v) for k, v in shift.items()}
+        for det_idx in range(stacked.shape[0]):
+            n = shift_map.get(det_idx, 0)
+            if n != 0:
+                stacked[det_idx] = _apply_shift_numpy(stacked[det_idx], n)
+
     pulse_index = pd.MultiIndex.from_arrays(
         [[train_id] * n_pulses, list(range(n_pulses))],
         names=['trainId', 'pulseId'],
@@ -56,7 +77,7 @@ def _convert_train_event(train_event, addresses: list, baseline_region=None) -> 
     )
 
 
-def _doocspie_worker(addresses, timeout_seconds, queue, stop_event, baseline_region=None):
+def _doocspie_worker(addresses, timeout_seconds, queue, stop_event, baseline_region=None, shift=None):
     """Worker process: blocks on successive trains and enqueues DataArrays."""
     from doocspie.abo import TrainAbo
 
@@ -68,7 +89,7 @@ def _doocspie_worker(addresses, timeout_seconds, queue, stop_event, baseline_reg
         if stop_event.is_set():
             break
         try:
-            da = _convert_train_event(train_event, addresses, baseline_region=baseline_region)
+            da = _convert_train_event(train_event, addresses, baseline_region=baseline_region, shift=shift)
             try:
                 queue.put_nowait(da)
             except Exception:
@@ -187,12 +208,15 @@ class DoocspieStream:
 
         doocs_cfg = GlobalConfig.get_for_class('DoocspieStream')
         self._baseline_region = doocs_cfg.get('baselineRegion', None)
+        raw_shift = doocs_cfg.get('shift', {})
+        self._shift = {int(k): int(v) for k, v in raw_shift.items()} if raw_shift else {}
 
         self._queue: Queue = Queue(maxsize=4)
         self._stop_event = Event()
         self._process = Process(
             target=_doocspie_worker,
-            args=(self._addresses, timeout_seconds, self._queue, self._stop_event, self._baseline_region),
+            args=(self._addresses, timeout_seconds, self._queue, self._stop_event, self._baseline_region, self._shift),
+
             daemon=True,
         )
         self._process.start()
