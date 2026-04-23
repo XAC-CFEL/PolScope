@@ -476,6 +476,7 @@ class AngularHeatmapCanvas(FigureCanvasQTAgg):
         self.angles_rad = np.deg2rad(self.angles_deg)
 
         self._colorbar = None
+        self._cbar_mappable = None
 
     def set_angles(self, angles_deg):
         """Update the detector-angle mapping (degrees)."""
