@@ -69,12 +69,15 @@ def _doocspie_worker(addresses, timeout_seconds, queue, stop_event, baseline_reg
             break
         try:
             da = _convert_train_event(train_event, addresses, baseline_region=baseline_region)
-            if queue.full():
+            try:
+                queue.put_nowait(da)
+            except Exception:
+                # Queue full — drop oldest item and retry
                 try:
                     queue.get_nowait()
+                    queue.put_nowait(da)
                 except Exception:
                     pass
-            queue.put_nowait(da)
         except Exception as e:
             print(f"DoocspieStream conversion error: {e}")
             traceback.print_exc()
