@@ -431,6 +431,20 @@ class MainWindow(QMainWindow):
         self.polar_beta_spin.valueChanged.connect(self.on_polar_param_changed)
         polar_layout.addWidget(self.polar_beta_spin, row, 1)
 
+        row += 1
+        self.polar_fix_plin_check = QCheckBox("Fix Plin:")
+        self.polar_fix_plin_check.setChecked(False)
+        self.polar_fix_plin_check.stateChanged.connect(self._on_fix_plin_toggled)
+        polar_layout.addWidget(self.polar_fix_plin_check, row, 0)
+        self.polar_plin_spin = QDoubleSpinBox()
+        self.polar_plin_spin.setRange(0.0, 1.0)
+        self.polar_plin_spin.setSingleStep(0.01)
+        self.polar_plin_spin.setDecimals(4)
+        self.polar_plin_spin.setValue(1.0)
+        self.polar_plin_spin.setEnabled(False)
+        self.polar_plin_spin.valueChanged.connect(self.on_polar_param_changed)
+        polar_layout.addWidget(self.polar_plin_spin, row, 1)
+
         polar_group.setLayout(polar_layout)
         layout.addWidget(polar_group)
 
@@ -675,6 +689,17 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self.file_label.setText(f"Error: {e}")
                 return
+
+            # Apply angles from NXSLoader config to the polar / heatmap canvases
+            nxs_cfg = GlobalConfig.get_for_class('NXSLoader')
+            if nxs_cfg and 'angles' in nxs_cfg:
+                angles_cfg = nxs_cfg['angles']
+                if isinstance(angles_cfg, dict):
+                    angles_list = [angles_cfg[k] for k in sorted(angles_cfg)]
+                else:
+                    angles_list = list(angles_cfg)
+                self.polar_canvas.set_angles(angles_list)
+                self.heatmap_canvas.set_angles(angles_list)
         else:
             raw = self.doocs_addresses_edit.toPlainText().strip()
             addresses = [a.strip() for a in raw.splitlines() if a.strip()]
@@ -1102,6 +1127,11 @@ class MainWindow(QMainWindow):
                 self.update_single_detector_plot(self.last_plot_data)
             self.single_det_needs_update = False
 
+    def _on_fix_plin_toggled(self, state):
+        """Enable/disable the Plin spinbox depending on the checkbox"""
+        self.polar_plin_spin.setEnabled(bool(state))
+        self.on_polar_param_changed()
+
     def on_polar_param_changed(self):
         """Handle changes to polar plot parameters"""
         if self.tab_widget.currentIndex() == 2:
@@ -1213,12 +1243,14 @@ class MainWindow(QMainWindow):
         peak_no = self.polar_peak_spin.value()
         value_type = self.polar_value_combo.currentText()
         beta = self.polar_beta_spin.value()
+        set_plin = self.polar_plin_spin.value() if self.polar_fix_plin_check.isChecked() else None
 
         self.polar_canvas.update_polar_plot(
             self.last_results_df,
             peak_no=peak_no,
             value_type=value_type,
-            beta=beta
+            beta=beta,
+            setPlin=set_plin
         )
 
     def update_results_table(self):

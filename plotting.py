@@ -335,7 +335,7 @@ class PolarPlotCanvas(FigureCanvasQTAgg):
         self.draw()
         self.background = self.copy_from_bbox(self.fig.bbox)
 
-    def update_polar_plot(self, results_df, peak_no=0, value_type='height', beta=2.0):
+    def update_polar_plot(self, results_df, peak_no=0, value_type='height', beta=2.0, setPlin=None):
         """
         Update the polar plot with new data.
 
@@ -344,6 +344,7 @@ class PolarPlotCanvas(FigureCanvasQTAgg):
             peak_no: Which peak number to plot (0-indexed)
             value_type: 'height' or 'fwhm area'
             beta: Beta parameter for polarization model
+            setPlin: Fix Plin to this value (None = free)
         """
         if self.background is None:
             self.init_blit()
@@ -402,37 +403,36 @@ class PolarPlotCanvas(FigureCanvasQTAgg):
         # Fit polarization model if we have enough data points
         if len(theta) >= 3:
             try:
-                self._fit_and_plot(theta, r_values, beta, r_max)
+                self._fit_and_plot(theta, r_values, beta, r_max, setPlin=setPlin)
             except Exception as e:
                 print(f"Fit error: {e}")
                 self.fit_text.set_text(f"Fit failed: {str(e)[:30]}")
 
         self._redraw_artists()
 
-    def _fit_and_plot(self, theta, r_values, beta, r_max):
+    def _fit_and_plot(self, theta, r_values, beta, r_max, setPlin=None):
         """Fit the polarization model and update plot"""
-        # Define model with fixed beta
-        def model(theta, Plin, phi, scale):
-            return polarization_model(theta, Plin=Plin, phi=phi, beta2=beta, scale=scale)
-
-        # Initial guess
+        fit_kws = dict(method='trf', ftol=1e-10, xtol=1e-10, gtol=1e-10, maxfev=5000)
         scale_guess = np.mean(r_values)
-        initial_guess = [0.2, 0.0, scale_guess]
-        bounds = ([0.0, -np.pi, 0], [2.0, np.pi, np.inf])
 
-        # Fit
-        popt, pcov = curve_fit(
-            model, theta, r_values,
-            p0=initial_guess,
-            bounds=bounds,
-            method='trf',
-            ftol=1e-10,
-            xtol=1e-10,
-            gtol=1e-10,
-            maxfev=5000
-        )
+        if setPlin is not None:
+            # Plin is fixed — only fit phi and scale
+            def model(theta, phi, scale):
+                return polarization_model(theta, Plin=setPlin, phi=phi, beta2=beta, scale=scale)
+            initial_guess = [0.0, scale_guess]
+            bounds = ([-np.pi, 0], [np.pi, np.inf])
+            popt, pcov = curve_fit(model, theta, r_values, p0=initial_guess, bounds=bounds, **fit_kws)
+            phi_fit, scale_fit = popt
+            Plin_fit = setPlin
+        else:
+            # Plin is free
+            def model(theta, Plin, phi, scale):
+                return polarization_model(theta, Plin=Plin, phi=phi, beta2=beta, scale=scale)
+            initial_guess = [0.2, 0.0, scale_guess]
+            bounds = ([0.0, -np.pi, 0], [2.0, np.pi, np.inf])
+            popt, pcov = curve_fit(model, theta, r_values, p0=initial_guess, bounds=bounds, **fit_kws)
+            Plin_fit, phi_fit, scale_fit = popt
 
-        Plin_fit, phi_fit, scale_fit = popt
         self.last_fit_params = {
             'Plin': Plin_fit,
             'phi': phi_fit,
@@ -458,7 +458,8 @@ class PolarPlotCanvas(FigureCanvasQTAgg):
 
         # Update fit text
         phi_deg = np.rad2deg(phi_fit) % 360
-        fit_info = (f"Plin: {Plin_fit:.4f}\n"
+        plin_label = f"Plin: {Plin_fit:.4f} (fixed)" if setPlin is not None else f"Plin: {Plin_fit:.4f}"
+        fit_info = (f"{plin_label}\n"
                     f"φ: {phi_deg:.1f}°\n"
                     f"β: {beta:.3f}\n"
                     f"Scale: {scale_fit:.4f}")
