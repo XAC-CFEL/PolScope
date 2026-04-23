@@ -1186,11 +1186,13 @@ class MainWindow(QMainWindow):
         try:
             with open(path, 'r') as fh:
                 data = _yaml.safe_load(fh)
-            if not isinstance(data, dict) or 'detectors' not in data:
-                raise ValueError("calib.yaml must contain a 'detectors' mapping")
-            raw = data['detectors']
+            if not isinstance(data, dict):
+                raise ValueError("calibration file must be a YAML mapping")
+            raw = data.get('calibration') or data.get('detectors')
+            if raw is None:
+                raise ValueError("calibration file must contain a 'calibration' (or 'detectors') mapping")
             if not isinstance(raw, dict):
-                raise ValueError("'detectors' must be a mapping of detector_id: coefficient")
+                raise ValueError("'calibration' must be a mapping of detector_id: coefficient")
             self.calib_coefficients = {int(k): float(v) for k, v in raw.items()}
             n = len(self.calib_coefficients)
             self.calib_status_label.setText(f"Loaded {n} detector(s)\n{Path(path).name}")
