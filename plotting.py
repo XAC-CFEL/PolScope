@@ -335,7 +335,7 @@ class PolarPlotCanvas(FigureCanvasQTAgg):
         self.draw()
         self.background = self.copy_from_bbox(self.fig.bbox)
 
-    def update_polar_plot(self, results_df, peak_no=0, value_type='height', beta=2.0, setPlin=None, fitBeta=False):
+    def update_polar_plot(self, results_df, peak_no=0, value_type='height', beta=2.0, setPlin=None, fitBeta=False, setPhi=None, fitPhi=True):
         """
         Update the polar plot with new data.
 
@@ -346,6 +346,8 @@ class PolarPlotCanvas(FigureCanvasQTAgg):
             beta: Fixed beta value (used when fitBeta=False)
             setPlin: Fixed Plin value (used when fitBeta=True)
             fitBeta: If True, fit beta2 freely with Plin fixed to setPlin
+            setPhi: Fixed phi value in radians (used when fitPhi=False)
+            fitPhi: If True, phi is a free fit parameter; if False, phi is fixed to setPhi
         """
         if self.background is None:
             self.init_blit()
@@ -404,7 +406,7 @@ class PolarPlotCanvas(FigureCanvasQTAgg):
         # Fit polarization model if we have enough data points
         if len(theta) >= 3:
             try:
-                self._fit_and_plot(theta, r_values, beta, r_max, setPlin=setPlin, fitBeta=fitBeta)
+                self._fit_and_plot(theta, r_values, beta, r_max, setPlin=setPlin, fitBeta=fitBeta, setPhi=setPhi, fitPhi=fitPhi)
             except Exception as e:
                 print(f"Fit error: {e}")
                 self.fit_text.set_text(f"Fit failed: {str(e)[:30]}")

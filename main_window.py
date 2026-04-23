@@ -232,8 +232,8 @@ class MainWindow(QMainWindow):
         row = 0
         param_layout.addWidget(QLabel("Buffer Size:"), row, 0)
         self.buffer_size_spin = QSpinBox()
-        self.buffer_size_spin.setRange(1, 100)
-        self.buffer_size_spin.setValue(1)
+        self.buffer_size_spin.setRange(1, 1000)
+        self.buffer_size_spin.setValue(100)
         self.buffer_size_spin.setEnabled(False)
         self.buffer_size_spin.valueChanged.connect(self.on_buffer_size_changed)
         param_layout.addWidget(self.buffer_size_spin, row, 1)
@@ -312,7 +312,7 @@ class MainWindow(QMainWindow):
         param_layout.addWidget(QLabel("Smooth Window:"), row, 0)
         self.smooth_window_spin = QSpinBox()
         self.smooth_window_spin.setRange(1, 50)
-        self.smooth_window_spin.setValue(5)
+        self.smooth_window_spin.setValue(1)
         self.smooth_window_spin.setToolTip("Window size for rolling average smoothing (1 = no smoothing)")
         self.smooth_window_spin.valueChanged.connect(lambda _: self.update_processing_config())
         param_layout.addWidget(self.smooth_window_spin, row, 1)
@@ -454,6 +454,23 @@ class MainWindow(QMainWindow):
         self.polar_plin_spin.setEnabled(False)  # disabled in Fit Plin mode
         self.polar_plin_spin.valueChanged.connect(self.on_polar_param_changed)
         polar_layout.addWidget(self.polar_plin_spin, row, 1)
+
+        row += 1
+        polar_layout.addWidget(QLabel("\u03c6 (deg):"), row, 0)
+        self.polar_phi_spin = QDoubleSpinBox()
+        self.polar_phi_spin.setRange(-180.0, 180.0)
+        self.polar_phi_spin.setSingleStep(1.0)
+        self.polar_phi_spin.setDecimals(2)
+        self.polar_phi_spin.setValue(0.0)
+        self.polar_phi_spin.setEnabled(False)  # disabled when Fit φ is checked
+        self.polar_phi_spin.valueChanged.connect(self.on_polar_param_changed)
+        polar_layout.addWidget(self.polar_phi_spin, row, 1)
+
+        row += 1
+        self.polar_fit_phi_check = QCheckBox("Fit \u03c6")
+        self.polar_fit_phi_check.setChecked(True)
+        self.polar_fit_phi_check.stateChanged.connect(self._on_fit_phi_changed)
+        polar_layout.addWidget(self.polar_fit_phi_check, row, 0, 1, 2)
 
         polar_group.setLayout(polar_layout)
         layout.addWidget(polar_group)
@@ -1146,6 +1163,12 @@ class MainWindow(QMainWindow):
         self.polar_plin_spin.setEnabled(fit_beta)
         self.on_polar_param_changed()
 
+    def _on_fit_phi_changed(self, state):
+        """Enable/disable phi spinbox based on Fit φ checkbox"""
+        fit_phi = bool(state)
+        self.polar_phi_spin.setEnabled(not fit_phi)
+        self.on_polar_param_changed()
+
     def on_polar_param_changed(self):
         """Handle changes to polar plot parameters"""
         if self.tab_widget.currentIndex() == 2:
@@ -1259,6 +1282,8 @@ class MainWindow(QMainWindow):
         fit_beta = self.polar_fit_beta_radio.isChecked()
         beta = self.polar_beta_spin.value()
         set_plin = self.polar_plin_spin.value() if fit_beta else None
+        fit_phi = self.polar_fit_phi_check.isChecked()
+        set_phi = None if fit_phi else np.deg2rad(self.polar_phi_spin.value())
 
         self.polar_canvas.update_polar_plot(
             self.last_results_df,
@@ -1266,7 +1291,9 @@ class MainWindow(QMainWindow):
             value_type=value_type,
             beta=beta,
             setPlin=set_plin,
-            fitBeta=fit_beta
+            fitBeta=fit_beta,
+            setPhi=set_phi,
+            fitPhi=fit_phi,
         )
 
     def update_results_table(self):
