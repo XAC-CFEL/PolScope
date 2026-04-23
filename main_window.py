@@ -963,7 +963,8 @@ class MainWindow(QMainWindow):
         if self.tab_widget.currentIndex() == 0:  # Plots tab
             render_start = time.time()
             self.canvas.fast_update(plot_data_list,
-                                    show_baseline=self.show_baseline_check.isChecked())
+                                    show_baseline=self.show_baseline_check.isChecked(),
+                                    normalize=self.normalize_check.isChecked())
             self.performance_monitor.record_stage('plot_render', time.time() - render_start)
         else:
             self.plots_need_update = True
@@ -991,7 +992,8 @@ class MainWindow(QMainWindow):
         if index == 0 and self.plots_need_update:  # Plots tab
             if self.last_plot_data is not None:
                 self.canvas.fast_update(self.last_plot_data,
-                                        show_baseline=self.show_baseline_check.isChecked())
+                                        show_baseline=self.show_baseline_check.isChecked(),
+                                        normalize=self.normalize_check.isChecked())
             self.plots_need_update = False
         elif index == 1 and self.results_need_update:  # Results tab
             self.update_results_table()
@@ -1016,7 +1018,8 @@ class MainWindow(QMainWindow):
         """Re-render Plots tab immediately when baseline toggle changes"""
         if self.last_plot_data is not None and self.tab_widget.currentIndex() == 0:
             self.canvas.background = None  # Force full redraw so artists are registered
-            self.canvas.fast_update(self.last_plot_data, show_baseline=bool(state))
+            self.canvas.fast_update(self.last_plot_data, show_baseline=bool(state),
+                                    normalize=self.normalize_check.isChecked())
         elif self.last_plot_data is not None and self.tab_widget.currentIndex() == 4:
             self.update_single_detector_plot(self.last_plot_data)
 
@@ -1048,7 +1051,9 @@ class MainWindow(QMainWindow):
         plot_data = plot_data_list[det_idx]
         self.single_det_canvas.ax.set_title(f'Detector {det_idx}', fontsize=10)
         self.single_det_canvas.update_plot(
-            plot_data, show_baseline=self.show_baseline_check.isChecked()
+            plot_data,
+            show_baseline=self.show_baseline_check.isChecked(),
+            normalize=self.normalize_check.isChecked()
         )
 
     def on_single_det_changed(self, index):

@@ -101,9 +101,9 @@ class FastMplCanvas(FigureCanvasQTAgg):
         self.draw()
         self.background = self.copy_from_bbox(self.fig.bbox)
 
-    def fast_update(self, plot_data_list: List[PlotData], show_baseline: bool = True):
+    def fast_update(self, plot_data_list: List[PlotData], show_baseline: bool = True, normalize: bool = True):
         """Fast update using blitting"""
-        # First, update xlim for all axes that have data and check if any changed
+        # First, update xlim/ylim for all axes that have data and check if any changed
         xlim_changed = False
         if self.background is not None:
             for i, plot_data in enumerate(plot_data_list):
@@ -119,6 +119,19 @@ class FastMplCanvas(FigureCanvasQTAgg):
                     # Check if limits changed significantly (more than 1% difference)
                     if (abs(current_xlim[0] - new_xmin) > abs(new_xmin) * 0.01 or
                             abs(current_xlim[1] - new_xmax) > abs(new_xmax) * 0.01):
+                        xlim_changed = True
+                    # Update ylim based on normalize flag
+                    current_ylim = ax.get_ylim()
+                    if normalize:
+                        new_ylim = (-0.1, 1.1)
+                    else:
+                        data_max = float(np.max(plot_data.values)) if len(plot_data.values) > 0 else 1.0
+                        if data_max <= 0:
+                            data_max = 1.0
+                        new_ylim = (-0.05 * data_max, 1.05 * data_max)
+                    if (abs(current_ylim[0] - new_ylim[0]) > abs(new_ylim[1]) * 0.01 or
+                            abs(current_ylim[1] - new_ylim[1]) > abs(new_ylim[1]) * 0.01):
+                        ax.set_ylim(new_ylim)
                         xlim_changed = True
 
         # If xlim changed or no background, need full redraw to update axis labels
@@ -697,7 +710,7 @@ class SingleDetectorCanvas(FigureCanvasQTAgg):
         self.fig.tight_layout(pad=1.5)
         self.draw_idle()
 
-    def update_plot(self, plot_data: PlotData, show_baseline: bool = True):
+    def update_plot(self, plot_data: PlotData, show_baseline: bool = True, normalize: bool = True):
         """Update the canvas with data for a single detector"""
         if plot_data is None or not plot_data.has_data:
             self.line.set_data([], [])
@@ -737,8 +750,11 @@ class SingleDetectorCanvas(FigureCanvasQTAgg):
                 xmax = float(plot_data.samples[-1])
                 if xmax > xmin:
                     self.ax.set_xlim([xmin, xmax])
-                self.ax.relim()
-                self.ax.autoscale_view(scalex=False, scaley=True)
+                if normalize:
+                    self.ax.set_ylim([-0.1, 1.1])
+                else:
+                    self.ax.relim()
+                    self.ax.autoscale_view(scalex=False, scaley=True)
         else:
             self.line.set_data([], [])
 
