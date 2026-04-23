@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout,
                               QDoubleSpinBox, QGroupBox, QGridLayout, QFileDialog,
                               QTextEdit, QCheckBox, QScrollArea, QTabWidget,
                               QTableWidget, QTableWidgetItem, QHeaderView,
-                              QComboBox, QRadioButton, QMessageBox)
+                              QComboBox, QRadioButton, QButtonGroup, QMessageBox)
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot
 from PyQt6.QtGui import QFont
 
@@ -418,13 +418,26 @@ class MainWindow(QMainWindow):
         self.polar_value_combo.currentTextChanged.connect(self.on_polar_param_changed)
         polar_layout.addWidget(self.polar_value_combo, row, 1)
 
+        # Fit-mode radio buttons
         row += 1
-        polar_layout.addWidget(QLabel("Beta (β):"), row, 0)
+        self.polar_fit_plin_radio = QRadioButton("Fit Plin")
+        self.polar_fit_beta_radio = QRadioButton("Fit Beta")
+        self.polar_fit_plin_radio.setChecked(True)
+        self._polar_fit_mode_group = QButtonGroup(self)
+        self._polar_fit_mode_group.addButton(self.polar_fit_plin_radio, 0)
+        self._polar_fit_mode_group.addButton(self.polar_fit_beta_radio, 1)
+        self._polar_fit_mode_group.idToggled.connect(self._on_fit_mode_changed)
+        radio_row = QHBoxLayout()
+        radio_row.addWidget(self.polar_fit_plin_radio)
+        radio_row.addWidget(self.polar_fit_beta_radio)
+        polar_layout.addLayout(radio_row, row, 0, 1, 2)
+
+        row += 1
+        polar_layout.addWidget(QLabel("β (fixed):"), row, 0)
         self.polar_beta_spin = QDoubleSpinBox()
-        self.polar_beta_spin.setRange(-2.0, 2.0)
+        self.polar_beta_spin.setRange(-4.0, 4.0)
         self.polar_beta_spin.setSingleStep(0.1)
         self.polar_beta_spin.setDecimals(4)
-        # Load default beta from config
         calibrate_config = GlobalConfig.get_for_class('Calibrate')
         default_beta = calibrate_config.get('beta', 2.0) if calibrate_config else 2.0
         self.polar_beta_spin.setValue(default_beta)
@@ -432,16 +445,13 @@ class MainWindow(QMainWindow):
         polar_layout.addWidget(self.polar_beta_spin, row, 1)
 
         row += 1
-        self.polar_fix_plin_check = QCheckBox("Fix Plin:")
-        self.polar_fix_plin_check.setChecked(False)
-        self.polar_fix_plin_check.stateChanged.connect(self._on_fix_plin_toggled)
-        polar_layout.addWidget(self.polar_fix_plin_check, row, 0)
+        polar_layout.addWidget(QLabel("Plin (fixed):"), row, 0)
         self.polar_plin_spin = QDoubleSpinBox()
         self.polar_plin_spin.setRange(0.0, 1.0)
         self.polar_plin_spin.setSingleStep(0.01)
         self.polar_plin_spin.setDecimals(4)
         self.polar_plin_spin.setValue(1.0)
-        self.polar_plin_spin.setEnabled(False)
+        self.polar_plin_spin.setEnabled(False)  # disabled in Fit Plin mode
         self.polar_plin_spin.valueChanged.connect(self.on_polar_param_changed)
         polar_layout.addWidget(self.polar_plin_spin, row, 1)
 
@@ -1127,9 +1137,13 @@ class MainWindow(QMainWindow):
                 self.update_single_detector_plot(self.last_plot_data)
             self.single_det_needs_update = False
 
-    def _on_fix_plin_toggled(self, state):
-        """Enable/disable the Plin spinbox depending on the checkbox"""
-        self.polar_plin_spin.setEnabled(bool(state))
+    def _on_fit_mode_changed(self, btn_id, checked):
+        """Switch which spinbox is active based on the fit-mode radio buttons"""
+        if not checked:
+            return
+        fit_beta = (btn_id == 1)
+        self.polar_beta_spin.setEnabled(not fit_beta)
+        self.polar_plin_spin.setEnabled(fit_beta)
         self.on_polar_param_changed()
 
     def on_polar_param_changed(self):
@@ -1242,15 +1256,17 @@ class MainWindow(QMainWindow):
 
         peak_no = self.polar_peak_spin.value()
         value_type = self.polar_value_combo.currentText()
+        fit_beta = self.polar_fit_beta_radio.isChecked()
         beta = self.polar_beta_spin.value()
-        set_plin = self.polar_plin_spin.value() if self.polar_fix_plin_check.isChecked() else None
+        set_plin = self.polar_plin_spin.value() if fit_beta else None
 
         self.polar_canvas.update_polar_plot(
             self.last_results_df,
             peak_no=peak_no,
             value_type=value_type,
             beta=beta,
-            setPlin=set_plin
+            setPlin=set_plin,
+            fitBeta=fit_beta
         )
 
     def update_results_table(self):
