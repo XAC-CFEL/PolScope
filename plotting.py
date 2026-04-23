@@ -101,8 +101,22 @@ class FastMplCanvas(FigureCanvasQTAgg):
         self.draw()
         self.background = self.copy_from_bbox(self.fig.bbox)
 
-    def fast_update(self, plot_data_list: List[PlotData], show_baseline: bool = True, normalize: bool = True):
+    def fast_update(self, plot_data_list: List[PlotData], show_baseline: bool = True, normalize: bool = True, shared_y: bool = False):
         """Fast update using blitting"""
+        # Pre-compute shared y-range when requested (and not normalizing)
+        if shared_y and not normalize:
+            all_maxes = [
+                float(np.max(pd.values))
+                for pd in plot_data_list
+                if pd.has_data and pd.is_enabled and len(pd.values) > 0
+            ]
+            global_max = max(all_maxes) if all_maxes else 1.0
+            if global_max <= 0:
+                global_max = 1.0
+            shared_ylim = (-0.05 * global_max, 1.05 * global_max)
+        else:
+            shared_ylim = None
+
         # First, update xlim/ylim for all axes that have data and check if any changed
         xlim_changed = False
         if self.background is not None:
@@ -120,10 +134,12 @@ class FastMplCanvas(FigureCanvasQTAgg):
                     if (abs(current_xlim[0] - new_xmin) > abs(new_xmin) * 0.01 or
                             abs(current_xlim[1] - new_xmax) > abs(new_xmax) * 0.01):
                         xlim_changed = True
-                    # Update ylim based on normalize flag
+                    # Update ylim based on normalize / shared_y flags
                     current_ylim = ax.get_ylim()
                     if normalize:
                         new_ylim = (-0.1, 1.1)
+                    elif shared_ylim is not None:
+                        new_ylim = shared_ylim
                     else:
                         data_max = float(np.max(plot_data.values)) if len(plot_data.values) > 0 else 1.0
                         if data_max <= 0:

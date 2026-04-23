@@ -325,6 +325,13 @@ class MainWindow(QMainWindow):
         param_layout.addWidget(self.normalize_check, row, 0, 1, 2)
 
         row += 1
+        self.shared_y_check = QCheckBox("Shared Y Axis")
+        self.shared_y_check.setChecked(False)
+        self.shared_y_check.setToolTip("Use the same y-axis range across all detector subplots")
+        self.shared_y_check.stateChanged.connect(self.on_shared_y_changed)
+        param_layout.addWidget(self.shared_y_check, row, 0, 1, 2)
+
+        row += 1
         self.show_baseline_check = QCheckBox("Show Baseline Adjusted")
         self.show_baseline_check.setChecked(True)
         self.show_baseline_check.stateChanged.connect(self.on_show_baseline_changed)
@@ -332,6 +339,65 @@ class MainWindow(QMainWindow):
 
         param_group.setLayout(param_layout)
         layout.addWidget(param_group)
+
+        # Pulse Stacking
+        stack_group = QGroupBox("Pulse Stacking")
+        stack_layout = QGridLayout()
+
+        # Pre-populate from DoocspieStream stacking config or PeakFinder config
+        doocs_cfg = GlobalConfig.get_for_class('DoocspieStream')
+        stacking_cfg = doocs_cfg.get('stacking', {}) if doocs_cfg else {}
+        pf_cfg = GlobalConfig.get_for_class('PeakFinder')
+        default_stack_pulses = stacking_cfg.get('stackPulses', pf_cfg.get('stackPulses', True))
+        _raw_start = stacking_cfg.get('pulseStackStart', pf_cfg.get('pulseStackStart', None))
+        _raw_stop  = stacking_cfg.get('pulseStackStop',  pf_cfg.get('pulseStackStop',  None))
+        _raw_step  = stacking_cfg.get('pulseStackStep',  pf_cfg.get('pulseStackStep',  pf_cfg.get('pulseStackSize', None)))
+        default_pulse_start = -1 if _raw_start is None else int(_raw_start)
+        default_pulse_stop  = -1 if _raw_stop  is None else int(_raw_stop)
+        default_pulse_step  = -1 if _raw_step  is None else int(_raw_step)
+
+        row = 0
+        self.stack_pulses_check = QCheckBox("Stack Pulses")
+        self.stack_pulses_check.setChecked(bool(default_stack_pulses))
+        self.stack_pulses_check.setToolTip("Average traces over pulses within each train")
+        self.stack_pulses_check.stateChanged.connect(self._on_stack_pulses_toggled)
+        stack_layout.addWidget(self.stack_pulses_check, row, 0, 1, 2)
+
+        row += 1
+        stack_layout.addWidget(QLabel("Pulse Start:"), row, 0)
+        self.pulse_stack_start_spin = QSpinBox()
+        self.pulse_stack_start_spin.setRange(-1, 9999)
+        self.pulse_stack_start_spin.setValue(default_pulse_start)
+        self.pulse_stack_start_spin.setToolTip("-1 = start from first pulse")
+        self.pulse_stack_start_spin.valueChanged.connect(lambda _: self.update_processing_config())
+        stack_layout.addWidget(self.pulse_stack_start_spin, row, 1)
+
+        row += 1
+        stack_layout.addWidget(QLabel("Pulse Stop:"), row, 0)
+        self.pulse_stack_stop_spin = QSpinBox()
+        self.pulse_stack_stop_spin.setRange(-1, 9999)
+        self.pulse_stack_stop_spin.setValue(default_pulse_stop)
+        self.pulse_stack_stop_spin.setToolTip("-1 = include all pulses")
+        self.pulse_stack_stop_spin.valueChanged.connect(lambda _: self.update_processing_config())
+        stack_layout.addWidget(self.pulse_stack_stop_spin, row, 1)
+
+        row += 1
+        stack_layout.addWidget(QLabel("Pulse Step:"), row, 0)
+        self.pulse_stack_step_spin = QSpinBox()
+        self.pulse_stack_step_spin.setRange(-1, 9999)
+        self.pulse_stack_step_spin.setValue(default_pulse_step)
+        self.pulse_stack_step_spin.setToolTip("-1 = default stride (process every pulse)")
+        self.pulse_stack_step_spin.valueChanged.connect(lambda _: self.update_processing_config())
+        stack_layout.addWidget(self.pulse_stack_step_spin, row, 1)
+
+        stack_group.setLayout(stack_layout)
+        layout.addWidget(stack_group)
+
+        # Set initial enabled state for stacking spinboxes
+        _stack_enabled = bool(default_stack_pulses)
+        self.pulse_stack_start_spin.setEnabled(_stack_enabled)
+        self.pulse_stack_stop_spin.setEnabled(_stack_enabled)
+        self.pulse_stack_step_spin.setEnabled(_stack_enabled)
 
         # Polarization Plot Parameters
         polar_group = QGroupBox("Polarization Plot")
@@ -553,6 +619,16 @@ class MainWindow(QMainWindow):
             self.processing_config['roi'] = [self.roi_start_spin.value(), self.roi_end_spin.value()]
             self.processing_config['smoothWindow'] = self.smooth_window_spin.value()
 
+            # Pulse stacking
+            if hasattr(self, 'stack_pulses_check'):
+                self.processing_config['stackPulses'] = self.stack_pulses_check.isChecked()
+                start = self.pulse_stack_start_spin.value()
+                stop  = self.pulse_stack_stop_spin.value()
+                step  = self.pulse_stack_step_spin.value()
+                self.processing_config['pulseStackStart'] = None if start == -1 else start
+                self.processing_config['pulseStackStop']  = None if stop  == -1 else stop
+                self.processing_config['pulseStackStep']  = None if step  == -1 else step
+
             # Update plot worker ROI so plots show the limited range
             if hasattr(self, 'plot_worker') and self.plot_worker:
                 self.plot_worker.set_roi(self.roi_start_spin.value(), self.roi_end_spin.value())
@@ -574,6 +650,14 @@ class MainWindow(QMainWindow):
     def _on_source_mode_changed(self, checked):
         self.file_source_widget.setVisible(self.file_mode_radio.isChecked())
         self.doocs_source_widget.setVisible(self.doocs_mode_radio.isChecked())
+
+    def _on_stack_pulses_toggled(self, state):
+        """Enable/disable pulse stacking spinboxes based on the checkbox."""
+        enabled = bool(state)
+        self.pulse_stack_start_spin.setEnabled(enabled)
+        self.pulse_stack_stop_spin.setEnabled(enabled)
+        self.pulse_stack_step_spin.setEnabled(enabled)
+        self.update_processing_config()
 
     def select_file(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder with .nxs Files")
@@ -700,12 +784,19 @@ class MainWindow(QMainWindow):
             self.detector_groups.append(list(range(start_det, end_det)))
 
         # Store config for workers - only override GUI-controlled parameters
-        # Other parameters (like stackTrains, stackPulses, etc.) come from config.yaml
+        # Other parameters (like stackTrains, etc.) come from config.yaml
+        _ps_start = self.pulse_stack_start_spin.value()
+        _ps_stop  = self.pulse_stack_stop_spin.value()
+        _ps_step  = self.pulse_stack_step_spin.value()
         self.processing_config = {
             'threshold': self.threshold_spin.value(),
             'peakNo': self.peak_no_spin.value(),
             'roi': [self.roi_start_spin.value(), self.roi_end_spin.value()],
             'smoothWindow': self.smooth_window_spin.value(),
+            'stackPulses': self.stack_pulses_check.isChecked(),
+            'pulseStackStart': None if _ps_start == -1 else _ps_start,
+            'pulseStackStop':  None if _ps_stop  == -1 else _ps_stop,
+            'pulseStackStep':  None if _ps_step  == -1 else _ps_step,
         }
 
         # Create plot preparation worker (thread is fine for I/O-bound work)
@@ -964,7 +1055,8 @@ class MainWindow(QMainWindow):
             render_start = time.time()
             self.canvas.fast_update(plot_data_list,
                                     show_baseline=self.show_baseline_check.isChecked(),
-                                    normalize=self.normalize_check.isChecked())
+                                    normalize=self.normalize_check.isChecked(),
+                                    shared_y=self.shared_y_check.isChecked())
             self.performance_monitor.record_stage('plot_render', time.time() - render_start)
         else:
             self.plots_need_update = True
@@ -993,7 +1085,8 @@ class MainWindow(QMainWindow):
             if self.last_plot_data is not None:
                 self.canvas.fast_update(self.last_plot_data,
                                         show_baseline=self.show_baseline_check.isChecked(),
-                                        normalize=self.normalize_check.isChecked())
+                                        normalize=self.normalize_check.isChecked(),
+                                        shared_y=self.shared_y_check.isChecked())
             self.plots_need_update = False
         elif index == 1 and self.results_need_update:  # Results tab
             self.update_results_table()
@@ -1014,12 +1107,22 @@ class MainWindow(QMainWindow):
         if self.tab_widget.currentIndex() == 2:
             self.update_polar_plot()
 
+    def on_shared_y_changed(self, state):
+        """Re-render Plots tab immediately when shared y-axis toggle changes"""
+        if self.last_plot_data is not None and self.tab_widget.currentIndex() == 0:
+            self.canvas.background = None  # Force full redraw
+            self.canvas.fast_update(self.last_plot_data,
+                                    show_baseline=self.show_baseline_check.isChecked(),
+                                    normalize=self.normalize_check.isChecked(),
+                                    shared_y=bool(state))
+
     def on_show_baseline_changed(self, state):
         """Re-render Plots tab immediately when baseline toggle changes"""
         if self.last_plot_data is not None and self.tab_widget.currentIndex() == 0:
             self.canvas.background = None  # Force full redraw so artists are registered
             self.canvas.fast_update(self.last_plot_data, show_baseline=bool(state),
-                                    normalize=self.normalize_check.isChecked())
+                                    normalize=self.normalize_check.isChecked(),
+                                    shared_y=self.shared_y_check.isChecked())
         elif self.last_plot_data is not None and self.tab_widget.currentIndex() == 4:
             self.update_single_detector_plot(self.last_plot_data)
 
