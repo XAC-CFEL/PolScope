@@ -35,7 +35,7 @@ def process_detector_chunk(args):
 
         # Return stacked data and results directly (both are picklable)
         stacked_data = pf.data
-        results = pf.dataframe().results
+        results = pf.results
 
         return (worker_id, results, stacked_data)
     except Exception as e:
