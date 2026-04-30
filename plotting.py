@@ -609,6 +609,7 @@ class AngularHeatmapCanvas(FigureCanvasQTAgg):
         """
         # Clear only the polar axes — cax (colorbar slot) keeps its position
         self.ax.cla()
+        self.cax.cla()
         self.ax.set_theta_zero_location('E')
         self.ax.set_theta_direction(1)
         self.ax.set_title('Angular Heatmap', fontsize=12)
@@ -705,12 +706,8 @@ class AngularHeatmapCanvas(FigureCanvasQTAgg):
             )
             mesh.set_visible(False)
 
-        # Colourbar — reuse across updates to avoid accumulating mpl_connect resize
-        # callbacks (which would cause RecursionError after many redraws)
-        if self._colorbar is None:
-            self._colorbar = self.fig.colorbar(mesh, cax=self.cax, label='Intensity')
-        else:
-            self._colorbar.update_normal(mesh)
+        # Colourbar — drawn into the fixed cax slot, never touches self.ax geometry
+        self._colorbar = self.fig.colorbar(mesh, cax=self.cax, label='Intensity')
 
         self.ax.set_rlim(r_edges[0], r_edges[-1])
         self.ax.spines['polar'].set_visible(False)

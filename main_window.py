@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout,
                               QDoubleSpinBox, QGroupBox, QGridLayout, QFileDialog,
                               QTextEdit, QCheckBox, QScrollArea, QTabWidget,
                               QTableWidget, QTableWidgetItem, QHeaderView,
-                              QComboBox, QRadioButton, QButtonGroup, QMessageBox)
+                              QComboBox, QRadioButton, QMessageBox)
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot
 from PyQt6.QtGui import QFont
 
@@ -232,8 +232,8 @@ class MainWindow(QMainWindow):
         row = 0
         param_layout.addWidget(QLabel("Buffer Size:"), row, 0)
         self.buffer_size_spin = QSpinBox()
-        self.buffer_size_spin.setRange(1, 1000)
-        self.buffer_size_spin.setValue(100)
+        self.buffer_size_spin.setRange(1, 100)
+        self.buffer_size_spin.setValue(1)
         self.buffer_size_spin.setEnabled(False)
         self.buffer_size_spin.valueChanged.connect(self.on_buffer_size_changed)
         param_layout.addWidget(self.buffer_size_spin, row, 1)
@@ -312,7 +312,7 @@ class MainWindow(QMainWindow):
         param_layout.addWidget(QLabel("Smooth Window:"), row, 0)
         self.smooth_window_spin = QSpinBox()
         self.smooth_window_spin.setRange(1, 50)
-        self.smooth_window_spin.setValue(1)
+        self.smooth_window_spin.setValue(5)
         self.smooth_window_spin.setToolTip("Window size for rolling average smoothing (1 = no smoothing)")
         self.smooth_window_spin.valueChanged.connect(lambda _: self.update_processing_config())
         param_layout.addWidget(self.smooth_window_spin, row, 1)
@@ -418,59 +418,18 @@ class MainWindow(QMainWindow):
         self.polar_value_combo.currentTextChanged.connect(self.on_polar_param_changed)
         polar_layout.addWidget(self.polar_value_combo, row, 1)
 
-        # Fit-mode radio buttons
         row += 1
-        self.polar_fit_plin_radio = QRadioButton("Fit Plin")
-        self.polar_fit_beta_radio = QRadioButton("Fit Beta")
-        self.polar_fit_plin_radio.setChecked(True)
-        self._polar_fit_mode_group = QButtonGroup(self)
-        self._polar_fit_mode_group.addButton(self.polar_fit_plin_radio, 0)
-        self._polar_fit_mode_group.addButton(self.polar_fit_beta_radio, 1)
-        self._polar_fit_mode_group.idToggled.connect(self._on_fit_mode_changed)
-        radio_row = QHBoxLayout()
-        radio_row.addWidget(self.polar_fit_plin_radio)
-        radio_row.addWidget(self.polar_fit_beta_radio)
-        polar_layout.addLayout(radio_row, row, 0, 1, 2)
-
-        row += 1
-        polar_layout.addWidget(QLabel("β (fixed):"), row, 0)
+        polar_layout.addWidget(QLabel("Beta (β):"), row, 0)
         self.polar_beta_spin = QDoubleSpinBox()
-        self.polar_beta_spin.setRange(-4.0, 4.0)
+        self.polar_beta_spin.setRange(-2.0, 2.0)
         self.polar_beta_spin.setSingleStep(0.1)
         self.polar_beta_spin.setDecimals(4)
+        # Load default beta from config
         calibrate_config = GlobalConfig.get_for_class('Calibrate')
         default_beta = calibrate_config.get('beta', 2.0) if calibrate_config else 2.0
         self.polar_beta_spin.setValue(default_beta)
         self.polar_beta_spin.valueChanged.connect(self.on_polar_param_changed)
         polar_layout.addWidget(self.polar_beta_spin, row, 1)
-
-        row += 1
-        polar_layout.addWidget(QLabel("Plin (fixed):"), row, 0)
-        self.polar_plin_spin = QDoubleSpinBox()
-        self.polar_plin_spin.setRange(0.0, 1.0)
-        self.polar_plin_spin.setSingleStep(0.01)
-        self.polar_plin_spin.setDecimals(4)
-        self.polar_plin_spin.setValue(1.0)
-        self.polar_plin_spin.setEnabled(False)  # disabled in Fit Plin mode
-        self.polar_plin_spin.valueChanged.connect(self.on_polar_param_changed)
-        polar_layout.addWidget(self.polar_plin_spin, row, 1)
-
-        row += 1
-        polar_layout.addWidget(QLabel("\u03c6 (deg):"), row, 0)
-        self.polar_phi_spin = QDoubleSpinBox()
-        self.polar_phi_spin.setRange(-180.0, 180.0)
-        self.polar_phi_spin.setSingleStep(1.0)
-        self.polar_phi_spin.setDecimals(2)
-        self.polar_phi_spin.setValue(0.0)
-        self.polar_phi_spin.setEnabled(False)  # disabled when Fit φ is checked
-        self.polar_phi_spin.valueChanged.connect(self.on_polar_param_changed)
-        polar_layout.addWidget(self.polar_phi_spin, row, 1)
-
-        row += 1
-        self.polar_fit_phi_check = QCheckBox("Fit \u03c6")
-        self.polar_fit_phi_check.setChecked(True)
-        self.polar_fit_phi_check.stateChanged.connect(self._on_fit_phi_changed)
-        polar_layout.addWidget(self.polar_fit_phi_check, row, 0, 1, 2)
 
         polar_group.setLayout(polar_layout)
         layout.addWidget(polar_group)
@@ -692,14 +651,6 @@ class MainWindow(QMainWindow):
         self.file_source_widget.setVisible(self.file_mode_radio.isChecked())
         self.doocs_source_widget.setVisible(self.doocs_mode_radio.isChecked())
 
-    def _on_stack_pulses_toggled(self, state):
-        """Enable/disable pulse stacking spinboxes based on the checkbox."""
-        enabled = bool(state)
-        self.pulse_stack_start_spin.setEnabled(enabled)
-        self.pulse_stack_stop_spin.setEnabled(enabled)
-        self.pulse_stack_step_spin.setEnabled(enabled)
-        self.update_processing_config()
-
     def select_file(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder with .nxs Files")
         if folder:
@@ -716,17 +667,6 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self.file_label.setText(f"Error: {e}")
                 return
-
-            # Apply angles from NXSLoader config to the polar / heatmap canvases
-            nxs_cfg = GlobalConfig.get_for_class('NXSLoader')
-            if nxs_cfg and 'angles' in nxs_cfg:
-                angles_cfg = nxs_cfg['angles']
-                if isinstance(angles_cfg, dict):
-                    angles_list = [angles_cfg[k] for k in sorted(angles_cfg)]
-                else:
-                    angles_list = list(angles_cfg)
-                self.polar_canvas.set_angles(angles_list)
-                self.heatmap_canvas.set_angles(angles_list)
         else:
             raw = self.doocs_addresses_edit.toPlainText().strip()
             addresses = [a.strip() for a in raw.splitlines() if a.strip()]
@@ -1017,10 +957,11 @@ class MainWindow(QMainWindow):
                     if normalized_data is not None:
                         self.stage_load['normalized_data'][worker_id] = normalized_data
 
-                    # Correct peak positions for ROI offset: PeakFinder returns 0-based array
+                    # Correct peak positions for ROI offset: PeakFinder returns 0-based array. Fixed in latest ToFPipechange
                     # indices, but the trace is displayed using the actual sample coordinates
                     # (which start at roi_start). Adding roi_start aligns markers with trace.
                     if results is not None and isinstance(self.stage_load['results'], list):
+                        """
                         roi_start = self.processing_config.get('roi', [0, 10000])[0]
                         if roi_start and roi_start > 0 and not results.empty:
                             results = results.copy()
@@ -1028,6 +969,7 @@ class MainWindow(QMainWindow):
                             for col in ('baseline left', 'baseline right'):
                                 if col in results.columns:
                                     results[col] = results[col] + roi_start
+                        """
                         self.stage_load['results'].append(results)
 
                     self.stage_load['finished_count'] += 1
@@ -1154,21 +1096,6 @@ class MainWindow(QMainWindow):
                 self.update_single_detector_plot(self.last_plot_data)
             self.single_det_needs_update = False
 
-    def _on_fit_mode_changed(self, btn_id, checked):
-        """Switch which spinbox is active based on the fit-mode radio buttons"""
-        if not checked:
-            return
-        fit_beta = (btn_id == 1)
-        self.polar_beta_spin.setEnabled(not fit_beta)
-        self.polar_plin_spin.setEnabled(fit_beta)
-        self.on_polar_param_changed()
-
-    def _on_fit_phi_changed(self, state):
-        """Enable/disable phi spinbox based on Fit φ checkbox"""
-        fit_phi = bool(state)
-        self.polar_phi_spin.setEnabled(not fit_phi)
-        self.on_polar_param_changed()
-
     def on_polar_param_changed(self):
         """Handle changes to polar plot parameters"""
         if self.tab_widget.currentIndex() == 2:
@@ -1253,13 +1180,11 @@ class MainWindow(QMainWindow):
         try:
             with open(path, 'r') as fh:
                 data = _yaml.safe_load(fh)
-            if not isinstance(data, dict):
-                raise ValueError("calibration file must be a YAML mapping")
-            raw = data.get('calibration') or data.get('detectors')
-            if raw is None:
-                raise ValueError("calibration file must contain a 'calibration' (or 'detectors') mapping")
+            if not isinstance(data, dict) or 'detectors' not in data:
+                raise ValueError("calib.yaml must contain a 'detectors' mapping")
+            raw = data['detectors']
             if not isinstance(raw, dict):
-                raise ValueError("'calibration' must be a mapping of detector_id: coefficient")
+                raise ValueError("'detectors' must be a mapping of detector_id: coefficient")
             self.calib_coefficients = {int(k): float(v) for k, v in raw.items()}
             n = len(self.calib_coefficients)
             self.calib_status_label.setText(f"Loaded {n} detector(s)\n{Path(path).name}")
@@ -1279,21 +1204,13 @@ class MainWindow(QMainWindow):
 
         peak_no = self.polar_peak_spin.value()
         value_type = self.polar_value_combo.currentText()
-        fit_beta = self.polar_fit_beta_radio.isChecked()
         beta = self.polar_beta_spin.value()
-        set_plin = self.polar_plin_spin.value() if fit_beta else None
-        fit_phi = self.polar_fit_phi_check.isChecked()
-        set_phi = None if fit_phi else np.deg2rad(self.polar_phi_spin.value())
 
         self.polar_canvas.update_polar_plot(
             self.last_results_df,
             peak_no=peak_no,
             value_type=value_type,
-            beta=beta,
-            setPlin=set_plin,
-            fitBeta=fit_beta,
-            setPhi=set_phi,
-            fitPhi=fit_phi,
+            beta=beta
         )
 
     def update_results_table(self):
