@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout,
                               QDoubleSpinBox, QGroupBox, QGridLayout, QFileDialog,
                               QTextEdit, QCheckBox, QScrollArea, QTabWidget,
                               QTableWidget, QTableWidgetItem, QHeaderView,
-                              QComboBox, QRadioButton, QMessageBox)
+                              QComboBox, QRadioButton, QButtonGroup, QMessageBox)
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot
 from PyQt6.QtGui import QFont
 
@@ -312,7 +312,7 @@ class MainWindow(QMainWindow):
         param_layout.addWidget(QLabel("Smooth Window:"), row, 0)
         self.smooth_window_spin = QSpinBox()
         self.smooth_window_spin.setRange(1, 50)
-        self.smooth_window_spin.setValue(5)
+        self.smooth_window_spin.setValue(1)
         self.smooth_window_spin.setToolTip("Window size for rolling average smoothing (1 = no smoothing)")
         self.smooth_window_spin.valueChanged.connect(lambda _: self.update_processing_config())
         param_layout.addWidget(self.smooth_window_spin, row, 1)
@@ -430,6 +430,31 @@ class MainWindow(QMainWindow):
         self.polar_beta_spin.setValue(default_beta)
         self.polar_beta_spin.valueChanged.connect(self.on_polar_param_changed)
         polar_layout.addWidget(self.polar_beta_spin, row, 1)
+
+        # Fit-mode radio buttons
+        row += 1
+        self.polar_fit_plin_radio = QRadioButton("Fit Plin")
+        self.polar_fit_beta_radio = QRadioButton("Fit Beta")
+        self.polar_fit_plin_radio.setChecked(True)
+        self._polar_fit_mode_group = QButtonGroup(self)
+        self._polar_fit_mode_group.addButton(self.polar_fit_plin_radio, 0)
+        self._polar_fit_mode_group.addButton(self.polar_fit_beta_radio, 1)
+        self._polar_fit_mode_group.idToggled.connect(self._on_fit_mode_changed)
+        radio_row = QHBoxLayout()
+        radio_row.addWidget(self.polar_fit_plin_radio)
+        radio_row.addWidget(self.polar_fit_beta_radio)
+        polar_layout.addLayout(radio_row, row, 0, 1, 2)
+
+        row += 1
+        polar_layout.addWidget(QLabel("Plin (fixed):"), row, 0)
+        self.polar_plin_spin = QDoubleSpinBox()
+        self.polar_plin_spin.setRange(0.0, 1.0)
+        self.polar_plin_spin.setSingleStep(0.01)
+        self.polar_plin_spin.setDecimals(4)
+        self.polar_plin_spin.setValue(1.0)
+        self.polar_plin_spin.setEnabled(False)  # disabled in Fit Plin mode
+        self.polar_plin_spin.valueChanged.connect(self.on_polar_param_changed)
+        polar_layout.addWidget(self.polar_plin_spin, row, 1)
 
         polar_group.setLayout(polar_layout)
         layout.addWidget(polar_group)
@@ -646,6 +671,13 @@ class MainWindow(QMainWindow):
                   f"peakNo={self.processing_config['peakNo']}, "
                   f"roi={self.processing_config['roi']}, "
                   f"smoothWindow={self.processing_config['smoothWindow']}")
+
+    def _on_stack_pulses_toggled(self, state):
+        enabled = bool(state)
+        self.pulse_stack_start_spin.setEnabled(enabled)
+        self.pulse_stack_stop_spin.setEnabled(enabled)
+        self.pulse_stack_step_spin.setEnabled(enabled)
+        self.update_processing_config()
 
     def _on_source_mode_changed(self, checked):
         self.file_source_widget.setVisible(self.file_mode_radio.isChecked())
@@ -1096,6 +1128,15 @@ class MainWindow(QMainWindow):
                 self.update_single_detector_plot(self.last_plot_data)
             self.single_det_needs_update = False
 
+    def _on_fit_mode_changed(self, btn_id, checked):
+        """Switch which spinbox is active based on the fit-mode radio buttons"""
+        if not checked:
+            return
+        fit_beta = (btn_id == 1)
+        self.polar_beta_spin.setEnabled(not fit_beta)
+        self.polar_plin_spin.setEnabled(fit_beta)
+        self.on_polar_param_changed()
+
     def on_polar_param_changed(self):
         """Handle changes to polar plot parameters"""
         if self.tab_widget.currentIndex() == 2:
@@ -1204,13 +1245,17 @@ class MainWindow(QMainWindow):
 
         peak_no = self.polar_peak_spin.value()
         value_type = self.polar_value_combo.currentText()
+        fit_beta = self.polar_fit_beta_radio.isChecked()
         beta = self.polar_beta_spin.value()
+        set_plin = self.polar_plin_spin.value() if fit_beta else None
 
         self.polar_canvas.update_polar_plot(
             self.last_results_df,
             peak_no=peak_no,
             value_type=value_type,
-            beta=beta
+            beta=beta,
+            setPlin=set_plin,
+            fitBeta=fit_beta
         )
 
     def update_results_table(self):
