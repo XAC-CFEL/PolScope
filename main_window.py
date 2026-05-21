@@ -28,6 +28,16 @@ from ToFPipeline.ToFPipeline import GlobalConfig, Calibrate
 from models import PlotData
 from data_ingestion import CircularBuffer, DataStreamSimulator, DoocspieStream
 from processing import process_detector_chunk, PerformanceMonitor, PlotPreparationWorker
+
+
+class _NoScrollSpinBox(QSpinBox):
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class _NoScrollDoubleSpinBox(QDoubleSpinBox):
+    def wheelEvent(self, event):
+        event.ignore()
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT
 from plotting import FastMplCanvas, PolarPlotCanvas, AngularHeatmapCanvas, SingleDetectorCanvas, HistoryCanvas
 from history import HistoryBuffer
@@ -91,7 +101,7 @@ class SnapshotManagerDialog(QDialog):
             )
             row_layout.addWidget(name_edit, stretch=1)
 
-            alpha_spin = QDoubleSpinBox()
+            alpha_spin = _NoScrollDoubleSpinBox()
             alpha_spin.setRange(0.05, 1.0)
             alpha_spin.setSingleStep(0.05)
             alpha_spin.setDecimals(2)
@@ -284,14 +294,14 @@ class MainWindow(QMainWindow):
         hist_ctrl_layout = QGridLayout()
         _row = 0
         hist_ctrl_layout.addWidget(QLabel("Window (shots):"), _row, 0)
-        self.history_window_spin = QSpinBox()
+        self.history_window_spin = _NoScrollSpinBox()
         self.history_window_spin.setRange(10, 10000)
         self.history_window_spin.setValue(100)
         self.history_window_spin.valueChanged.connect(self.update_history_plot)
         hist_ctrl_layout.addWidget(self.history_window_spin, _row, 1)
         _row += 1
         hist_ctrl_layout.addWidget(QLabel("Peak No (pos/height):"), _row, 0)
-        self.history_peak_spin = QSpinBox()
+        self.history_peak_spin = _NoScrollSpinBox()
         self.history_peak_spin.setRange(0, 19)
         self.history_peak_spin.setValue(0)
         hist_ctrl_layout.addWidget(self.history_peak_spin, _row, 1)
@@ -438,7 +448,7 @@ class MainWindow(QMainWindow):
 
         row = 0
         param_layout.addWidget(QLabel("Buffer Size:"), row, 0)
-        self.buffer_size_spin = QSpinBox()
+        self.buffer_size_spin = _NoScrollSpinBox()
         self.buffer_size_spin.setRange(1, 10000)
         self.buffer_size_spin.setValue(1)
         self.buffer_size_spin.setEnabled(False)
@@ -453,14 +463,14 @@ class MainWindow(QMainWindow):
 
         row += 1
         param_layout.addWidget(QLabel("Detectors/Thread:"), row, 0)
-        self.det_per_thread_spin = QSpinBox()
+        self.det_per_thread_spin = _NoScrollSpinBox()
         self.det_per_thread_spin.setRange(1, 16)
         self.det_per_thread_spin.setValue(4)
         param_layout.addWidget(self.det_per_thread_spin, row, 1)
 
         row += 1
         param_layout.addWidget(QLabel("Pipeline Depth:"), row, 0)
-        self.pipeline_depth_spin = QSpinBox()
+        self.pipeline_depth_spin = _NoScrollSpinBox()
         self.pipeline_depth_spin.setRange(1, 10)
         self.pipeline_depth_spin.setValue(3)
         self.pipeline_depth_spin.setToolTip("Number of processing batches that can run in parallel")
@@ -468,7 +478,7 @@ class MainWindow(QMainWindow):
 
         row += 1
         param_layout.addWidget(QLabel("Update Rate (Hz):"), row, 0)
-        self.update_rate_spin = QSpinBox()
+        self.update_rate_spin = _NoScrollSpinBox()
         self.update_rate_spin.setRange(1, 50)
         self.update_rate_spin.setValue(10)
         self.update_rate_spin.valueChanged.connect(self.on_update_rate_changed)
@@ -476,7 +486,7 @@ class MainWindow(QMainWindow):
 
         row += 1
         param_layout.addWidget(QLabel("Plot Downsample:"), row, 0)
-        self.downsample_spin = QSpinBox()
+        self.downsample_spin = _NoScrollSpinBox()
         self.downsample_spin.setRange(1, 20)
         self.downsample_spin.setValue(1)
         self.downsample_spin.valueChanged.connect(self.on_downsample_changed)
@@ -484,7 +494,7 @@ class MainWindow(QMainWindow):
 
         row += 1
         param_layout.addWidget(QLabel("Peak Threshold:"), row, 0)
-        self.threshold_spin = QDoubleSpinBox()
+        self.threshold_spin = _NoScrollDoubleSpinBox()
         self.threshold_spin.setRange(0, 1)
         self.threshold_spin.setSingleStep(0.01)
         self.threshold_spin.setValue(0.1)
@@ -493,7 +503,7 @@ class MainWindow(QMainWindow):
 
         row += 1
         param_layout.addWidget(QLabel("Number of Peaks:"), row, 0)
-        self.peak_no_spin = QSpinBox()
+        self.peak_no_spin = _NoScrollSpinBox()
         self.peak_no_spin.setRange(1, 20)
         self.peak_no_spin.setValue(1)
         self.peak_no_spin.valueChanged.connect(lambda _: self.update_processing_config())
@@ -501,7 +511,7 @@ class MainWindow(QMainWindow):
 
         row += 1
         param_layout.addWidget(QLabel("ROI Start:"), row, 0)
-        self.roi_start_spin = QSpinBox()
+        self.roi_start_spin = _NoScrollSpinBox()
         self.roi_start_spin.setRange(0, 10000)
         self.roi_start_spin.setValue(0)
         self.roi_start_spin.editingFinished.connect(self.update_processing_config)
@@ -509,7 +519,7 @@ class MainWindow(QMainWindow):
 
         row += 1
         param_layout.addWidget(QLabel("ROI End:"), row, 0)
-        self.roi_end_spin = QSpinBox()
+        self.roi_end_spin = _NoScrollSpinBox()
         self.roi_end_spin.setRange(0, 10000)
         self.roi_end_spin.setValue(1000)
         self.roi_end_spin.editingFinished.connect(self.update_processing_config)
@@ -517,7 +527,7 @@ class MainWindow(QMainWindow):
 
         row += 1
         param_layout.addWidget(QLabel("Peak ROI Start:"), row, 0)
-        self.peak_roi_start_spin = QSpinBox()
+        self.peak_roi_start_spin = _NoScrollSpinBox()
         self.peak_roi_start_spin.setRange(-1, 10000)
         self.peak_roi_start_spin.setValue(-1)
         self.peak_roi_start_spin.setToolTip("-1 = no limit (use full loaded ROI)")
@@ -526,7 +536,7 @@ class MainWindow(QMainWindow):
 
         row += 1
         param_layout.addWidget(QLabel("Peak ROI End:"), row, 0)
-        self.peak_roi_end_spin = QSpinBox()
+        self.peak_roi_end_spin = _NoScrollSpinBox()
         self.peak_roi_end_spin.setRange(-1, 10000)
         self.peak_roi_end_spin.setValue(-1)
         self.peak_roi_end_spin.setToolTip("-1 = no limit (use full loaded ROI)")
@@ -535,7 +545,7 @@ class MainWindow(QMainWindow):
 
         row += 1
         param_layout.addWidget(QLabel("Smooth Window:"), row, 0)
-        self.smooth_window_spin = QSpinBox()
+        self.smooth_window_spin = _NoScrollSpinBox()
         self.smooth_window_spin.setRange(1, 50)
         self.smooth_window_spin.setValue(1)
         self.smooth_window_spin.setToolTip("Window size for rolling average smoothing (1 = no smoothing)")
@@ -590,7 +600,7 @@ class MainWindow(QMainWindow):
 
         row += 1
         stack_layout.addWidget(QLabel("Pulse Start:"), row, 0)
-        self.pulse_stack_start_spin = QSpinBox()
+        self.pulse_stack_start_spin = _NoScrollSpinBox()
         self.pulse_stack_start_spin.setRange(-1, 9999)
         self.pulse_stack_start_spin.setValue(default_pulse_start)
         self.pulse_stack_start_spin.setToolTip("-1 = start from first pulse")
@@ -599,7 +609,7 @@ class MainWindow(QMainWindow):
 
         row += 1
         stack_layout.addWidget(QLabel("Pulse Stop:"), row, 0)
-        self.pulse_stack_stop_spin = QSpinBox()
+        self.pulse_stack_stop_spin = _NoScrollSpinBox()
         self.pulse_stack_stop_spin.setRange(-1, 9999)
         self.pulse_stack_stop_spin.setValue(default_pulse_stop)
         self.pulse_stack_stop_spin.setToolTip("-1 = include all pulses")
@@ -608,7 +618,7 @@ class MainWindow(QMainWindow):
 
         row += 1
         stack_layout.addWidget(QLabel("Pulse Step:"), row, 0)
-        self.pulse_stack_step_spin = QSpinBox()
+        self.pulse_stack_step_spin = _NoScrollSpinBox()
         self.pulse_stack_step_spin.setRange(-1, 9999)
         self.pulse_stack_step_spin.setValue(default_pulse_step)
         self.pulse_stack_step_spin.setToolTip("-1 = default stride (process every pulse)")
@@ -630,7 +640,7 @@ class MainWindow(QMainWindow):
 
         row = 0
         polar_layout.addWidget(QLabel("Peak Number:"), row, 0)
-        self.polar_peak_spin = QSpinBox()
+        self.polar_peak_spin = _NoScrollSpinBox()
         self.polar_peak_spin.setRange(0, 19)
         self.polar_peak_spin.setValue(0)
         self.polar_peak_spin.valueChanged.connect(self.on_polar_param_changed)
@@ -645,7 +655,7 @@ class MainWindow(QMainWindow):
 
         row += 1
         polar_layout.addWidget(QLabel("Beta (β):"), row, 0)
-        self.polar_beta_spin = QDoubleSpinBox()
+        self.polar_beta_spin = _NoScrollDoubleSpinBox()
         self.polar_beta_spin.setRange(-2.0, 2.0)
         self.polar_beta_spin.setSingleStep(0.1)
         self.polar_beta_spin.setDecimals(4)
@@ -672,7 +682,7 @@ class MainWindow(QMainWindow):
 
         row += 1
         polar_layout.addWidget(QLabel("Plin (fixed):"), row, 0)
-        self.polar_plin_spin = QDoubleSpinBox()
+        self.polar_plin_spin = _NoScrollDoubleSpinBox()
         self.polar_plin_spin.setRange(0.0, 1.0)
         self.polar_plin_spin.setSingleStep(0.01)
         self.polar_plin_spin.setDecimals(4)
@@ -687,7 +697,7 @@ class MainWindow(QMainWindow):
         self.polar_fix_phi_check.stateChanged.connect(self._on_fix_phi_changed)
         polar_layout.addWidget(self.polar_fix_phi_check, row, 0)
 
-        self.polar_phi_spin = QDoubleSpinBox()
+        self.polar_phi_spin = _NoScrollDoubleSpinBox()
         self.polar_phi_spin.setRange(-180.0, 180.0)
         self.polar_phi_spin.setSingleStep(1.0)
         self.polar_phi_spin.setDecimals(1)
@@ -706,7 +716,7 @@ class MainWindow(QMainWindow):
 
         row = 0
         heatmap_layout.addWidget(QLabel("Sample Min:"), row, 0)
-        self.heatmap_smin_spin = QSpinBox()
+        self.heatmap_smin_spin = _NoScrollSpinBox()
         self.heatmap_smin_spin.setRange(0, 10000)
         self.heatmap_smin_spin.setValue(0)
         self.heatmap_smin_spin.valueChanged.connect(self.on_heatmap_param_changed)
@@ -714,7 +724,7 @@ class MainWindow(QMainWindow):
 
         row += 1
         heatmap_layout.addWidget(QLabel("Sample Max:"), row, 0)
-        self.heatmap_smax_spin = QSpinBox()
+        self.heatmap_smax_spin = _NoScrollSpinBox()
         self.heatmap_smax_spin.setRange(0, 10000)
         self.heatmap_smax_spin.setValue(1000)
         self.heatmap_smax_spin.valueChanged.connect(self.on_heatmap_param_changed)
@@ -756,13 +766,13 @@ class MainWindow(QMainWindow):
         calc_layout = QGridLayout()
 
         calc_layout.addWidget(QLabel("Peak No:"), 0, 0)
-        self.calib_peakno_spin = QSpinBox()
+        self.calib_peakno_spin = _NoScrollSpinBox()
         self.calib_peakno_spin.setRange(0, 20)
         self.calib_peakno_spin.setValue(0)
         calc_layout.addWidget(self.calib_peakno_spin, 0, 1)
 
         calc_layout.addWidget(QLabel("Plin:"), 1, 0)
-        self.calib_plin_spin = QDoubleSpinBox()
+        self.calib_plin_spin = _NoScrollDoubleSpinBox()
         self.calib_plin_spin.setRange(0.0, 1.0)
         self.calib_plin_spin.setSingleStep(0.01)
         self.calib_plin_spin.setDecimals(4)
@@ -770,7 +780,7 @@ class MainWindow(QMainWindow):
         calc_layout.addWidget(self.calib_plin_spin, 1, 1)
 
         calc_layout.addWidget(QLabel("Beta (β₂):"), 2, 0)
-        self.calib_beta_spin = QDoubleSpinBox()
+        self.calib_beta_spin = _NoScrollDoubleSpinBox()
         self.calib_beta_spin.setRange(-2.0, 4.0)
         self.calib_beta_spin.setSingleStep(0.1)
         self.calib_beta_spin.setDecimals(4)
@@ -778,7 +788,7 @@ class MainWindow(QMainWindow):
         calc_layout.addWidget(self.calib_beta_spin, 2, 1)
 
         calc_layout.addWidget(QLabel("phi (°):"), 3, 0)
-        self.calib_phi_spin = QDoubleSpinBox()
+        self.calib_phi_spin = _NoScrollDoubleSpinBox()
         self.calib_phi_spin.setRange(-360.0, 360.0)
         self.calib_phi_spin.setSingleStep(1.0)
         self.calib_phi_spin.setDecimals(2)
@@ -805,7 +815,7 @@ class MainWindow(QMainWindow):
         snap_layout = QGridLayout()
 
         snap_layout.addWidget(QLabel("Alpha:"), 0, 0)
-        self.snapshot_alpha_spin = QDoubleSpinBox()
+        self.snapshot_alpha_spin = _NoScrollDoubleSpinBox()
         self.snapshot_alpha_spin.setRange(0.05, 1.0)
         self.snapshot_alpha_spin.setSingleStep(0.05)
         self.snapshot_alpha_spin.setDecimals(2)
