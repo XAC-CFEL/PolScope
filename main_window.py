@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot
 from PyQt6.QtGui import QFont
 
-from ToFPipeline.ToFPipeline import GlobalConfig
+from ToFPipeline.ToFPipeline import GlobalConfig, Calibrate
 
 from models import PlotData
 from data_ingestion import CircularBuffer, DataStreamSimulator, DoocspieStream
@@ -309,6 +309,24 @@ class MainWindow(QMainWindow):
         param_layout.addWidget(self.roi_end_spin, row, 1)
 
         row += 1
+        param_layout.addWidget(QLabel("Peak ROI Start:"), row, 0)
+        self.peak_roi_start_spin = QSpinBox()
+        self.peak_roi_start_spin.setRange(-1, 10000)
+        self.peak_roi_start_spin.setValue(-1)
+        self.peak_roi_start_spin.setToolTip("-1 = no limit (use full loaded ROI)")
+        self.peak_roi_start_spin.editingFinished.connect(self.update_processing_config)
+        param_layout.addWidget(self.peak_roi_start_spin, row, 1)
+
+        row += 1
+        param_layout.addWidget(QLabel("Peak ROI End:"), row, 0)
+        self.peak_roi_end_spin = QSpinBox()
+        self.peak_roi_end_spin.setRange(-1, 10000)
+        self.peak_roi_end_spin.setValue(-1)
+        self.peak_roi_end_spin.setToolTip("-1 = no limit (use full loaded ROI)")
+        self.peak_roi_end_spin.editingFinished.connect(self.update_processing_config)
+        param_layout.addWidget(self.peak_roi_end_spin, row, 1)
+
+        row += 1
         param_layout.addWidget(QLabel("Smooth Window:"), row, 0)
         self.smooth_window_spin = QSpinBox()
         self.smooth_window_spin.setRange(1, 50)
@@ -456,6 +474,22 @@ class MainWindow(QMainWindow):
         self.polar_plin_spin.valueChanged.connect(self.on_polar_param_changed)
         polar_layout.addWidget(self.polar_plin_spin, row, 1)
 
+        row += 1
+        self.polar_fix_phi_check = QCheckBox("Fix φ")
+        self.polar_fix_phi_check.setChecked(False)
+        self.polar_fix_phi_check.stateChanged.connect(self._on_fix_phi_changed)
+        polar_layout.addWidget(self.polar_fix_phi_check, row, 0)
+
+        self.polar_phi_spin = QDoubleSpinBox()
+        self.polar_phi_spin.setRange(-180.0, 180.0)
+        self.polar_phi_spin.setSingleStep(1.0)
+        self.polar_phi_spin.setDecimals(1)
+        self.polar_phi_spin.setSuffix(" °")
+        self.polar_phi_spin.setValue(0.0)
+        self.polar_phi_spin.setEnabled(False)  # enabled only when Fix φ is checked
+        self.polar_phi_spin.valueChanged.connect(self.on_polar_param_changed)
+        polar_layout.addWidget(self.polar_phi_spin, row, 1)
+
         polar_group.setLayout(polar_layout)
         layout.addWidget(polar_group)
 
@@ -509,6 +543,52 @@ class MainWindow(QMainWindow):
         calib_clear_btn = QPushButton("Clear Calibration")
         calib_clear_btn.clicked.connect(self.clear_calibration)
         calib_layout.addWidget(calib_clear_btn)
+
+        # --- Calculate from buffer ---
+        calc_group = QGroupBox("Calculate from Buffer")
+        calc_layout = QGridLayout()
+
+        calc_layout.addWidget(QLabel("Peak No:"), 0, 0)
+        self.calib_peakno_spin = QSpinBox()
+        self.calib_peakno_spin.setRange(0, 20)
+        self.calib_peakno_spin.setValue(0)
+        calc_layout.addWidget(self.calib_peakno_spin, 0, 1)
+
+        calc_layout.addWidget(QLabel("Plin:"), 1, 0)
+        self.calib_plin_spin = QDoubleSpinBox()
+        self.calib_plin_spin.setRange(0.0, 1.0)
+        self.calib_plin_spin.setSingleStep(0.01)
+        self.calib_plin_spin.setDecimals(4)
+        self.calib_plin_spin.setValue(1.0)
+        calc_layout.addWidget(self.calib_plin_spin, 1, 1)
+
+        calc_layout.addWidget(QLabel("Beta (β₂):"), 2, 0)
+        self.calib_beta_spin = QDoubleSpinBox()
+        self.calib_beta_spin.setRange(-2.0, 4.0)
+        self.calib_beta_spin.setSingleStep(0.1)
+        self.calib_beta_spin.setDecimals(4)
+        self.calib_beta_spin.setValue(2.0)
+        calc_layout.addWidget(self.calib_beta_spin, 2, 1)
+
+        calc_layout.addWidget(QLabel("phi (°):"), 3, 0)
+        self.calib_phi_spin = QDoubleSpinBox()
+        self.calib_phi_spin.setRange(-360.0, 360.0)
+        self.calib_phi_spin.setSingleStep(1.0)
+        self.calib_phi_spin.setDecimals(2)
+        self.calib_phi_spin.setValue(0.0)
+        calc_layout.addWidget(self.calib_phi_spin, 3, 1)
+
+        calc_layout.addWidget(QLabel("Int. Method:"), 4, 0)
+        self.calib_intmethod_combo = QComboBox()
+        self.calib_intmethod_combo.addItems(["height", "fwhm area"])
+        calc_layout.addWidget(self.calib_intmethod_combo, 4, 1)
+
+        calc_btn = QPushButton("Calculate & Load")
+        calc_btn.clicked.connect(self.calibrate_from_buffer)
+        calc_layout.addWidget(calc_btn, 5, 0, 1, 2)
+
+        calc_group.setLayout(calc_layout)
+        calib_layout.addWidget(calc_group)
 
         calib_group.setLayout(calib_layout)
         layout.addWidget(calib_group)
@@ -642,6 +722,12 @@ class MainWindow(QMainWindow):
             self.processing_config['threshold'] = self.threshold_spin.value()
             self.processing_config['peakNo'] = self.peak_no_spin.value()-1  # zero-index internally
             self.processing_config['roi'] = [self.roi_start_spin.value(), self.roi_end_spin.value()]
+            peak_roi_start = self.peak_roi_start_spin.value()
+            peak_roi_end = self.peak_roi_end_spin.value()
+            self.processing_config['peakfinder_roi'] = [
+                None if peak_roi_start == -1 else peak_roi_start,
+                None if peak_roi_end == -1 else peak_roi_end,
+            ]
             self.processing_config['smoothWindow'] = self.smooth_window_spin.value()
 
             # Pulse stacking
@@ -670,6 +756,7 @@ class MainWindow(QMainWindow):
             print(f"Config updated: threshold={self.processing_config['threshold']}, "
                   f"peakNo={self.processing_config['peakNo']}, "
                   f"roi={self.processing_config['roi']}, "
+                  f"peakfinder_roi={self.processing_config['peakfinder_roi']}, "
                   f"smoothWindow={self.processing_config['smoothWindow']}")
 
     def _on_stack_pulses_toggled(self, state):
@@ -1137,6 +1224,11 @@ class MainWindow(QMainWindow):
         self.polar_plin_spin.setEnabled(fit_beta)
         self.on_polar_param_changed()
 
+    def _on_fix_phi_changed(self, state):
+        """Enable/disable the phi spinbox based on the Fix φ checkbox"""
+        self.polar_phi_spin.setEnabled(bool(state))
+        self.on_polar_param_changed()
+
     def on_polar_param_changed(self):
         """Handle changes to polar plot parameters"""
         if self.tab_widget.currentIndex() == 2:
@@ -1221,11 +1313,11 @@ class MainWindow(QMainWindow):
         try:
             with open(path, 'r') as fh:
                 data = _yaml.safe_load(fh)
-            if not isinstance(data, dict) or 'detectors' not in data:
-                raise ValueError("calib.yaml must contain a 'detectors' mapping")
-            raw = data['detectors']
+            if not isinstance(data, dict):
+                raise ValueError("calib.yaml must be a YAML mapping")
+            raw = data.get('detectors') or data.get('calibration')
             if not isinstance(raw, dict):
-                raise ValueError("'detectors' must be a mapping of detector_id: coefficient")
+                raise ValueError("calib.yaml must contain a 'detectors' or 'calibration' mapping")
             self.calib_coefficients = {int(k): float(v) for k, v in raw.items()}
             n = len(self.calib_coefficients)
             self.calib_status_label.setText(f"Loaded {n} detector(s)\n{Path(path).name}")
@@ -1238,6 +1330,74 @@ class MainWindow(QMainWindow):
         self.calib_coefficients = {}
         self.calib_status_label.setText("No calibration loaded")
 
+    def calibrate_from_buffer(self):
+        """Calculate transmission calibration coefficients from current buffer results and save to temp_calibration.yaml"""
+        if not _YAML_AVAILABLE:
+            QMessageBox.critical(self, "Missing dependency",
+                                 "PyYAML is not installed. Run: pip install pyyaml")
+            return
+
+        if self.last_results_df is None or self.last_results_df.empty:
+            QMessageBox.warning(self, "No data", "No results in buffer. Run processing first.")
+            return
+
+        peak_no = self.calib_peakno_spin.value()
+        set_plin = self.calib_plin_spin.value()
+        set_beta = self.calib_beta_spin.value()
+        set_phi = np.deg2rad(self.calib_phi_spin.value())
+        int_method = self.calib_intmethod_combo.currentText()
+
+        try:
+            df = self.last_results_df.copy()
+
+            # Add Angles column by mapping detector id -> angle (degrees) from polar canvas
+            angles_deg = self.polar_canvas.angles_deg
+            df["Angles"] = df["detector"].apply(
+                lambda d: float(angles_deg[int(d)]) if int(d) < len(angles_deg) else 0.0
+            )
+
+            # Add dummy Photon Energy column (single energy in buffer)
+            df["Photon Energy"] = 0
+
+            calib = Calibrate(df)
+            calib.transmission(
+                peakNo=peak_no,
+                setBeta=set_beta,
+                setPhi=set_phi,
+                setPlin=set_plin,
+                intMethod=int_method,
+            )
+
+            # Build per-detector coefficient dict (mean over any duplicate entries)
+            trans_df = calib.transmissionParam
+            coeff_dict = (
+                trans_df.groupby("detector")["Transmission Coefficient"]
+                .mean()
+                .to_dict()
+            )
+            coeff_dict = {int(k): float(v) for k, v in coeff_dict.items()}
+
+            # Save to temp_calibration.yaml in the same format as calibration.yaml
+            save_path = Path(__file__).parent / "temp_calibration.yaml"
+            yaml_data = {
+                "device": "temp_buffer_calibration",
+                "calibration": {int(k): round(float(v), 6) for k, v in coeff_dict.items()},
+            }
+            with open(save_path, "w") as fh:
+                _yaml.dump(yaml_data, fh, default_flow_style=False, sort_keys=True)
+
+            # Load into active coefficients
+            self.calib_coefficients = coeff_dict
+            n = len(coeff_dict)
+            self.calib_status_label.setText(
+                f"Buffer calib: {n} detector(s)\nSaved → temp_calibration.yaml"
+            )
+
+        except Exception as e:
+            QMessageBox.warning(self, "Calibration error", str(e))
+            self.calib_status_label.setText("Calibration failed — see console")
+            raise
+
     def update_polar_plot(self):
         """Update the polarization plot with current results"""
         if self.last_results_df is None or self.last_results_df.empty:
@@ -1248,6 +1408,8 @@ class MainWindow(QMainWindow):
         fit_beta = self.polar_fit_beta_radio.isChecked()
         beta = self.polar_beta_spin.value()
         set_plin = self.polar_plin_spin.value() if fit_beta else None
+        fix_phi = self.polar_fix_phi_check.isChecked()
+        set_phi = np.deg2rad(self.polar_phi_spin.value()) if fix_phi else None
 
         self.polar_canvas.update_polar_plot(
             self.last_results_df,
@@ -1255,7 +1417,9 @@ class MainWindow(QMainWindow):
             value_type=value_type,
             beta=beta,
             setPlin=set_plin,
-            fitBeta=fit_beta
+            fitBeta=fit_beta,
+            setPhi=set_phi,
+            fitPhi=not fix_phi
         )
 
     def update_results_table(self):

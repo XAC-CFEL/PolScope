@@ -30,12 +30,23 @@ def process_detector_chunk(args):
         if smooth_window > 1:
             pf.smooth(windowSize=smooth_window).smooth(windowSize=smooth_window)
 
-        # Find peaks (ROI already applied, so pass [None, None])
-        pf.process(roi=[None, None])
+        # Find peaks within the peak-specific ROI (separate from the loader ROI).
+        # Subtract loader roi_start so the indices map onto the PeakFinder's 0-based slice.
+        roi_start = config.get('roi', [None, None])[0] or 0
+        raw_peak_roi = config.get('peakfinder_roi', [None, None])
+        peak_roi = [
+            (raw_peak_roi[0] - roi_start) if raw_peak_roi[0] is not None else None,
+            (raw_peak_roi[1] - roi_start) if raw_peak_roi[1] is not None else None,
+        ]
+        pf.process(roi=peak_roi)
 
-        # Return stacked data and results directly (both are picklable)
-        stacked_data = pf.data
+        # Offset peak positions back to original sample coordinate space.
         results = pf.results
+        if results is not None and not results.empty and roi_start != 0:
+            if "pos" in results.columns:
+                results["pos"] = results["pos"] + roi_start
+
+        stacked_data = pf.data
 
         return (worker_id, results, stacked_data)
     except Exception as e:

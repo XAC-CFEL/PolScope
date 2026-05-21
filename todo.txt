@@ -1,0 +1,7 @@
+temp calib button
+line graph
+ref spektrum
+
+
+
+replay vom run?
