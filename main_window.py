@@ -341,7 +341,7 @@ class MainWindow(QMainWindow):
         row = 0
         param_layout.addWidget(QLabel("Buffer Size:"), row, 0)
         self.buffer_size_spin = QSpinBox()
-        self.buffer_size_spin.setRange(1, 100)
+        self.buffer_size_spin.setRange(1, 10000)
         self.buffer_size_spin.setValue(1)
         self.buffer_size_spin.setEnabled(False)
         self.buffer_size_spin.valueChanged.connect(self.on_buffer_size_changed)
