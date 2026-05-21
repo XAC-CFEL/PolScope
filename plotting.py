@@ -7,7 +7,7 @@ from matplotlib.collections import LineCollection
 from scipy.optimize import curve_fit
 from typing import List
 
-from ToFPipeline.ToFPipeline import GlobalConfig, polarization_model
+from ToFPipeline.ToFPipeline import GlobalConfig, polarization_model, sepModel
 from colors import (COLOR_TRACE, COLOR_PEAK, COLOR_FWHM, COLOR_DATA,
                     COLOR_FIT, COLOR_PHI, COLOR_DISABLED, COLOR_GRAY)
 from models import PlotData
@@ -618,10 +618,13 @@ class PolarPlotCanvas(FigureCanvasQTAgg):
         beta0 = beta if beta != 0 else 1.0
         phi0 = setPhi if setPhi is not None else 0.0
 
+        # Error variables — None means the parameter was fixed (not fitted)
+        Plin_err = phi_err = beta2_err = scale_err = None
+
         if fitBeta:
             # Plin is fixed
             plin_val = setPlin if setPlin is not None else 1.0
-            plin_label = f"Plin: {plin_val:.4f} (fixed)"
+            Plin_fit = plin_val
             if fitPhi:
                 # fit phi, beta2, scale
                 def model(theta, phi, beta2, scale):
@@ -630,41 +633,62 @@ class PolarPlotCanvas(FigureCanvasQTAgg):
                 bounds = ([-np.pi, -4.0, 0], [np.pi, 4.0, np.inf])
                 popt, pcov = curve_fit(model, theta, r_values, p0=initial_guess, bounds=bounds, **fit_kws)
                 phi_fit, beta2_fit, scale_fit = popt
+                phi_err, beta2_err, scale_err = np.sqrt(np.diag(pcov))
             else:
                 # phi fixed; fit beta2, scale
                 phi_fixed = setPhi if setPhi is not None else 0.0
+                phi_fit = phi_fixed
                 def model(theta, beta2, scale):
                     return polarization_model(theta, Plin=plin_val, phi=phi_fixed, beta2=beta2, scale=scale)
                 initial_guess = [beta0, scale_guess]
                 bounds = ([-4.0, 0], [4.0, np.inf])
                 popt, pcov = curve_fit(model, theta, r_values, p0=initial_guess, bounds=bounds, **fit_kws)
                 beta2_fit, scale_fit = popt
-                phi_fit = phi_fixed
-            Plin_fit = plin_val
-            beta_label = f"β: {beta2_fit:.4f} (fitted)"
+                beta2_err, scale_err = np.sqrt(np.diag(pcov))
         else:
             # beta fixed
             beta2_fit = beta
-            beta_label = f"β: {beta:.3f} (fixed)"
             if fitPhi:
-                # fit Plin, phi, scale
-                def model(theta, Plin, phi, scale):
-                    return polarization_model(theta, Plin=Plin, phi=phi, beta2=beta, scale=scale)
-                initial_guess = [0.2, phi0, scale_guess]
-                bounds = ([0.0, -np.pi, 0], [2.0, np.pi, np.inf])
+                # Fully free (Plin and phi both fitted): use A/B parameterisation
+                # A = Plin·cos(2φ), B = Plin·sin(2φ) — linear, more numerically stable
+                def model(theta, A, B, scale):
+                    return sepModel(theta, A, B, beta2=beta, scale=scale)
+                initial_guess = [0.0, 0.0, scale_guess]
+                bounds = ([-2.0, -2.0, 0], [2.0, 2.0, np.inf])
                 popt, pcov = curve_fit(model, theta, r_values, p0=initial_guess, bounds=bounds, **fit_kws)
-                Plin_fit, phi_fit, scale_fit = popt
+                A_fit, B_fit, scale_fit = popt
+                scale_err = np.sqrt(pcov[2, 2])
+                cov_AB = pcov[:2, :2]
+
+                Plin_fit = np.sqrt(A_fit**2 + B_fit**2)
+                phi_fit = 0.5 * np.arctan2(B_fit, A_fit)
+
+                # Error propagation from cov(A, B) → σ_Plin and σ_φ
+                sigma_A2, sigma_B2, sigma_AB = cov_AB[0, 0], cov_AB[1, 1], cov_AB[0, 1]
+                if Plin_fit > 1e-10:
+                    Plin_err = np.sqrt(
+                        (A_fit / Plin_fit)**2 * sigma_A2 +
+                        (B_fit / Plin_fit)**2 * sigma_B2 +
+                        2 * (A_fit * B_fit / Plin_fit**2) * sigma_AB
+                    )
+                    phi_err = 0.5 * np.sqrt(
+                        (B_fit**2 * sigma_A2 + A_fit**2 * sigma_B2 - 2 * A_fit * B_fit * sigma_AB)
+                        / (A_fit**2 + B_fit**2)**2
+                    )
+                else:
+                    Plin_err = 0.0
+                    phi_err = 0.0
             else:
                 # phi fixed; fit Plin, scale
                 phi_fixed = setPhi if setPhi is not None else 0.0
+                phi_fit = phi_fixed
                 def model(theta, Plin, scale):
                     return polarization_model(theta, Plin=Plin, phi=phi_fixed, beta2=beta, scale=scale)
                 initial_guess = [0.2, scale_guess]
                 bounds = ([0.0, 0], [2.0, np.inf])
                 popt, pcov = curve_fit(model, theta, r_values, p0=initial_guess, bounds=bounds, **fit_kws)
                 Plin_fit, scale_fit = popt
-                phi_fit = phi_fixed
-            plin_label = f"Plin: {Plin_fit:.4f}"
+                Plin_err, scale_err = np.sqrt(np.diag(pcov))
 
         self.last_fit_params = {
             'Plin': Plin_fit,
@@ -689,12 +713,17 @@ class PolarPlotCanvas(FigureCanvasQTAgg):
             self.phi_line1.set_data([], [])
             self.phi_line2.set_data([], [])
 
-        # Update fit text
+        # Build fit info text — show ± uncertainty for fitted parameters, (fixed) otherwise
         phi_deg = np.rad2deg(phi_fit) % 360
-        fit_info = (f"{plin_label}\n"
-                    f"φ: {phi_deg:.1f}°\n"
-                    f"{beta_label}\n"
-                    f"Scale: {scale_fit:.4f}")
+        plin_str = (f"Plin: {Plin_fit:.4f} ± {Plin_err:.4f}" if Plin_err is not None
+                    else f"Plin: {Plin_fit:.4f} (fixed)")
+        phi_str = (f"φ: {phi_deg:.1f}° ± {np.rad2deg(phi_err):.1f}°" if phi_err is not None
+                   else f"φ: {phi_deg:.1f}° (fixed)")
+        beta_str = (f"β: {beta2_fit:.4f} ± {beta2_err:.4f}" if beta2_err is not None
+                    else f"β: {beta2_fit:.3f} (fixed)")
+        scale_str = (f"Scale: {scale_fit:.4f} ± {scale_err:.4f}" if scale_err is not None
+                     else f"Scale: {scale_fit:.4f}")
+        fit_info = f"{plin_str}\n{phi_str}\n{beta_str}\n{scale_str}"
         self.fit_text.set_text(fit_info)
 
     def _redraw_artists(self):
