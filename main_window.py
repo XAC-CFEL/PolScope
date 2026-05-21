@@ -313,10 +313,37 @@ class MainWindow(QMainWindow):
         hist_ctrl_layout.addWidget(self.history_status_label, _row, 0, 1, 2)
         hist_ctrl_group.setLayout(hist_ctrl_layout)
 
+        # Detector selector (pos/height only)
+        self.history_det_group = QGroupBox("Detectors (pos / height)")
+        self.history_det_group_layout = QVBoxLayout()
+
+        det_btn_row = QHBoxLayout()
+        all_btn = QPushButton("All")
+        none_btn = QPushButton("None")
+        all_btn.setFixedHeight(22)
+        none_btn.setFixedHeight(22)
+        all_btn.clicked.connect(lambda: self._set_all_history_dets(True))
+        none_btn.clicked.connect(lambda: self._set_all_history_dets(False))
+        det_btn_row.addWidget(all_btn)
+        det_btn_row.addWidget(none_btn)
+        self.history_det_group_layout.addLayout(det_btn_row)
+
+        self.history_det_checks: dict = {}   # det_id -> QCheckBox
+        self.history_det_grid_widget = QWidget()
+        self.history_det_grid_layout = QGridLayout(self.history_det_grid_widget)
+        self.history_det_grid_layout.setContentsMargins(0, 0, 0, 0)
+        self.history_det_grid_layout.setSpacing(2)
+        self.history_det_group_layout.addWidget(self.history_det_grid_widget)
+        self.history_det_group.setLayout(self.history_det_group_layout)
+        # Populate checkboxes for the initial detector count (16)
+        self._rebuild_history_det_checks(16)
+
         hist_ctrl_outer = QWidget()
-        hist_ctrl_outer.setMaximumWidth(210)
+        hist_ctrl_outer.setMinimumWidth(210)
+        hist_ctrl_outer.setMaximumWidth(240)
         hist_ctrl_outer_layout = QVBoxLayout(hist_ctrl_outer)
         hist_ctrl_outer_layout.addWidget(hist_ctrl_group)
+        hist_ctrl_outer_layout.addWidget(self.history_det_group)
         hist_ctrl_outer_layout.addStretch()
         history_outer_layout.addWidget(hist_ctrl_outer, stretch=0)
 
@@ -1078,6 +1105,7 @@ class MainWindow(QMainWindow):
 
         # Reset history for the new session
         self.history_canvas.set_n_detectors(self.n_detectors)
+        self._rebuild_history_det_checks(self.n_detectors)
         self.history_buffer.clear()
         if hasattr(self, 'history_status_label'):
             self.history_status_label.setText("0 shots recorded")
@@ -1784,7 +1812,7 @@ class MainWindow(QMainWindow):
         self.history_canvas.update_history(
             df,
             memory_start_shot=self.history_buffer.memory_start_shot,
-            enabled_detectors=self.enabled_detectors,
+            enabled_detectors=self._get_history_det_selection(),
             window=window,
         )
 
@@ -1796,9 +1824,43 @@ class MainWindow(QMainWindow):
         self.history_canvas.update_history(
             df,
             memory_start_shot=self.history_buffer.memory_start_shot,
-            enabled_detectors=self.enabled_detectors,
+            enabled_detectors=self._get_history_det_selection(),
             window=None,  # Don't change xlim — user is in manual-navigation mode
         )
+
+    def _get_history_det_selection(self) -> set:
+        """Return the set of detector ids currently checked in the history panel."""
+        return {det_id for det_id, cb in self.history_det_checks.items() if cb.isChecked()}
+
+    def _rebuild_history_det_checks(self, n: int):
+        """Populate the detector checkbox grid for *n* detectors (4 columns)."""
+        # Clear old checkboxes
+        for cb in self.history_det_checks.values():
+            cb.deleteLater()
+        self.history_det_checks.clear()
+        # Remove all items from the grid layout
+        while self.history_det_grid_layout.count():
+            item = self.history_det_grid_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        cols = 4
+        for det_id in range(n):
+            cb = QCheckBox(f'D{det_id}')
+            cb.setChecked(True)
+            cb.setFixedHeight(18)
+            cb.stateChanged.connect(self.update_history_plot)
+            self.history_det_checks[det_id] = cb
+            self.history_det_grid_layout.addWidget(cb, det_id // cols, det_id % cols)
+
+    def _set_all_history_dets(self, checked: bool):
+        """Check or uncheck all history detector checkboxes."""
+        for cb in self.history_det_checks.values():
+            cb.blockSignals(True)
+            cb.setChecked(checked)
+            cb.blockSignals(False)
+        self.update_history_plot()
+
 
     def _clear_history(self):
         """Discard in-RAM history and start a fresh session."""
