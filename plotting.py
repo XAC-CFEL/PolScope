@@ -126,9 +126,20 @@ class FastMplCanvas(FigureCanvasQTAgg):
             else:
                 (line,) = ax.plot([], [], color=color, linewidth=0.8, alpha=alpha, zorder=1.5)
             snap_lines.append(line)
-        self.snapshots.append({'label': label, 'alpha': alpha, 'visible': True, 'lines': snap_lines})
+        self.snapshots.append({'label': label, 'alpha': alpha, 'visible': True,
+                               'lines': snap_lines, 'color': color})
         self.background = None
         self.draw_idle()
+
+    def set_snapshot_alpha(self, idx, alpha):
+        """Change a snapshot's alpha without removing it."""
+        if 0 <= idx < len(self.snapshots):
+            self.snapshots[idx]['alpha'] = alpha
+            for line in self.snapshots[idx]['lines']:
+                if line is not None:
+                    line.set_alpha(alpha)
+            self.background = None
+            self.draw_idle()
 
     def remove_snapshot(self, idx):
         """Remove a snapshot by index and force re-blit."""
@@ -378,6 +389,9 @@ class PolarPlotCanvas(FigureCanvasQTAgg):
         self.background = None
         self.last_fit_params = None
 
+        # Snapshot reference lines
+        self.snapshots = []
+
         # Angles from config (degrees, will be converted to radians)
         nxs_config = GlobalConfig.get_for_class('NXSLoader')
         self.angles_deg = np.array(
@@ -404,6 +418,72 @@ class PolarPlotCanvas(FigureCanvasQTAgg):
         """Initialize background for blitting"""
         self.draw()
         self.background = self.copy_from_bbox(self.fig.bbox)
+
+    def take_snapshot(self, alpha=0.3, label=None):
+        """Capture the current polar data and fit as a static reference overlay."""
+        color = _SNAPSHOT_COLORS[len(self.snapshots) % len(_SNAPSHOT_COLORS)]
+        if label is None:
+            label = f"Snap {len(self.snapshots) + 1}"
+        theta_d, r_d = self.data_line.get_data()
+        theta_f, r_f = self.fit_line.get_data()
+        (snap_data,) = self.ax.plot(list(theta_d), list(r_d),
+                                    'o', markersize=5, color=color, alpha=alpha, zorder=1.5)
+        (snap_fit,) = self.ax.plot(list(theta_f), list(r_f),
+                                   '--', linewidth=1.5, color=color, alpha=alpha, zorder=1.5)
+        self.snapshots.append({'label': label, 'alpha': alpha, 'visible': True, 'color': color,
+                                'data_line': snap_data, 'fit_line': snap_fit})
+        self.background = None
+        self.last_fit_params = None
+        self.draw_idle()
+
+    def set_snapshot_alpha(self, idx, alpha):
+        """Change a snapshot's alpha without removing it."""
+        if 0 <= idx < len(self.snapshots):
+            snap = self.snapshots[idx]
+            snap['alpha'] = alpha
+            snap['data_line'].set_alpha(alpha)
+            snap['fit_line'].set_alpha(alpha)
+            self.background = None
+            self.last_fit_params = None
+            self.draw_idle()
+
+    def remove_snapshot(self, idx):
+        """Remove a polar snapshot by index."""
+        if 0 <= idx < len(self.snapshots):
+            snap = self.snapshots[idx]
+            for line in (snap['data_line'], snap['fit_line']):
+                try:
+                    line.remove()
+                except ValueError:
+                    pass
+            self.snapshots.pop(idx)
+            self.background = None
+            self.last_fit_params = None
+            self.draw_idle()
+
+    def set_snapshot_visible(self, idx, visible):
+        """Toggle a polar snapshot's visibility."""
+        if 0 <= idx < len(self.snapshots):
+            snap = self.snapshots[idx]
+            snap['visible'] = visible
+            snap['data_line'].set_visible(visible)
+            snap['fit_line'].set_visible(visible)
+            self.background = None
+            self.last_fit_params = None
+            self.draw_idle()
+
+    def clear_all_snapshots(self):
+        """Remove all polar snapshots."""
+        for snap in self.snapshots:
+            for line in (snap['data_line'], snap['fit_line']):
+                try:
+                    line.remove()
+                except ValueError:
+                    pass
+        self.snapshots.clear()
+        self.background = None
+        self.last_fit_params = None
+        self.draw_idle()
 
     def update_polar_plot(self, results_df, peak_no=0, value_type='height', beta=2.0, setPlin=None, fitBeta=False, setPhi=None, fitPhi=True):
         """
@@ -860,10 +940,17 @@ class SingleDetectorCanvas(FigureCanvasQTAgg):
             if pd_snap.has_data and pd_snap.is_enabled and len(pd_snap.samples) > 0:
                 line.set_data(pd_snap.samples, pd_snap.values)
         self.snapshots.append({
-            'label': label, 'alpha': alpha, 'visible': True,
+            'label': label, 'alpha': alpha, 'visible': True, 'color': color,
             'line': line, 'plot_data_list': list(plot_data_list)
         })
         self.draw_idle()
+
+    def set_snapshot_alpha(self, idx, alpha):
+        """Change a snapshot's alpha without removing it."""
+        if 0 <= idx < len(self.snapshots):
+            self.snapshots[idx]['alpha'] = alpha
+            self.snapshots[idx]['line'].set_alpha(alpha)
+            self.draw_idle()
 
     def remove_snapshot(self, idx):
         """Remove a snapshot by index."""

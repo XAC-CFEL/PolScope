@@ -42,47 +42,72 @@ class SnapshotManagerDialog(QDialog):
             Qt.WindowType.WindowStaysOnTopHint |
             Qt.WindowType.WindowCloseButtonHint
         )
-        self.resize(300, 240)
+        self.resize(360, 260)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Snapshots — check to show, click to select:"))
+        layout.addWidget(QLabel("Snapshots \u2014 toggle visibility / adjust alpha / delete:"))
 
         self.list_widget = QListWidget()
-        self.list_widget.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self.list_widget)
 
         btn_row = QHBoxLayout()
-        del_btn = QPushButton("Delete Selected")
-        del_btn.clicked.connect(self._delete_selected)
-        btn_row.addWidget(del_btn)
         clear_btn = QPushButton("Clear All")
         clear_btn.clicked.connect(self._clear_all)
         btn_row.addWidget(clear_btn)
+        btn_row.addStretch()
         layout.addLayout(btn_row)
 
-    def refresh(self, snapshot_labels):
-        """Rebuild the list from [(label, visible), ...] pairs."""
-        self.list_widget.blockSignals(True)
+    def refresh(self, snapshot_info):
+        """Rebuild the list from [(label, visible, alpha, color), ...] tuples."""
         self.list_widget.clear()
-        for i, (label, visible) in enumerate(snapshot_labels):
-            item = QListWidgetItem(label)
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Checked if visible else Qt.CheckState.Unchecked)
+        for i, (label, visible, alpha, color) in enumerate(snapshot_info):
+            item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, i)
+
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(4, 2, 4, 2)
+            row_layout.setSpacing(4)
+
+            swatch = QLabel("  ")
+            swatch.setFixedWidth(14)
+            swatch.setStyleSheet(f"background-color: {color}; border: 1px solid #888;")
+            row_layout.addWidget(swatch)
+
+            check = QCheckBox(label)
+            check.setChecked(visible)
+            check.toggled.connect(lambda checked, idx=i: self._on_visibility(idx, checked))
+            row_layout.addWidget(check, stretch=1)
+
+            alpha_spin = QDoubleSpinBox()
+            alpha_spin.setRange(0.05, 1.0)
+            alpha_spin.setSingleStep(0.05)
+            alpha_spin.setDecimals(2)
+            alpha_spin.setValue(alpha)
+            alpha_spin.setFixedWidth(64)
+            alpha_spin.setToolTip("Opacity")
+            alpha_spin.valueChanged.connect(lambda val, idx=i: self._on_alpha(idx, val))
+            row_layout.addWidget(alpha_spin)
+
+            del_btn = QPushButton("\u00d7")
+            del_btn.setFixedWidth(24)
+            del_btn.setFixedHeight(24)
+            del_btn.clicked.connect(lambda _, idx=i: self._on_delete(idx))
+            row_layout.addWidget(del_btn)
+
+            item.setSizeHint(row.sizeHint())
             self.list_widget.addItem(item)
-        self.list_widget.blockSignals(False)
+            self.list_widget.setItemWidget(item, row)
 
-    def _on_item_changed(self, item):
-        idx = item.data(Qt.ItemDataRole.UserRole)
-        visible = item.checkState() == Qt.CheckState.Checked
+    def _on_visibility(self, idx, checked):
         if self.parent() is not None:
-            self.parent().set_snapshot_visible(idx, visible)
+            self.parent().set_snapshot_visible(idx, checked)
 
-    def _delete_selected(self):
-        items = self.list_widget.selectedItems()
-        if not items:
-            return
-        idx = items[0].data(Qt.ItemDataRole.UserRole)
+    def _on_alpha(self, idx, val):
+        if self.parent() is not None:
+            self.parent().set_snapshot_alpha(idx, val)
+
+    def _on_delete(self, idx):
         if self.parent() is not None:
             self.parent().remove_snapshot(idx)
 
@@ -956,6 +981,7 @@ class MainWindow(QMainWindow):
 
         # Clear snapshots from the old canvas and reset manager
         self.single_det_canvas.clear_all_snapshots()
+        self.polar_canvas.clear_all_snapshots()
         if self.snapshot_manager is not None and self.snapshot_manager.isVisible():
             self.snapshot_manager.refresh([])
 
@@ -1398,9 +1424,9 @@ class MainWindow(QMainWindow):
     # Snapshot helpers                                                      #
     # ------------------------------------------------------------------ #
 
-    def _get_snapshot_labels(self):
-        """Return [(label, visible), ...] from the main canvas snapshot list."""
-        return [(s['label'], s['visible']) for s in self.canvas.snapshots]
+    def _get_snapshot_info(self):
+        """Return [(label, visible, alpha, color), ...] from the main canvas snapshot list."""
+        return [(s['label'], s['visible'], s['alpha'], s['color']) for s in self.canvas.snapshots]
 
     def take_snapshot(self):
         """Freeze the current plot data as a static reference overlay on all canvases."""
@@ -1413,25 +1439,35 @@ class MainWindow(QMainWindow):
             self.last_plot_data, alpha=alpha,
             current_det_idx=max(det_idx, 0)
         )
+        self.polar_canvas.take_snapshot(alpha=alpha)
         if self.snapshot_manager is not None and self.snapshot_manager.isVisible():
-            self.snapshot_manager.refresh(self._get_snapshot_labels())
+            self.snapshot_manager.refresh(self._get_snapshot_info())
 
     def remove_snapshot(self, idx):
         """Remove snapshot at *idx* from all canvases and refresh the manager dialog."""
         self.canvas.remove_snapshot(idx)
         self.single_det_canvas.remove_snapshot(idx)
+        self.polar_canvas.remove_snapshot(idx)
         if self.snapshot_manager is not None and self.snapshot_manager.isVisible():
-            self.snapshot_manager.refresh(self._get_snapshot_labels())
+            self.snapshot_manager.refresh(self._get_snapshot_info())
 
     def set_snapshot_visible(self, idx, visible):
         """Toggle snapshot visibility on all canvases."""
         self.canvas.set_snapshot_visible(idx, visible)
         self.single_det_canvas.set_snapshot_visible(idx, visible)
+        self.polar_canvas.set_snapshot_visible(idx, visible)
+
+    def set_snapshot_alpha(self, idx, alpha):
+        """Change a snapshot's alpha on all canvases."""
+        self.canvas.set_snapshot_alpha(idx, alpha)
+        self.single_det_canvas.set_snapshot_alpha(idx, alpha)
+        self.polar_canvas.set_snapshot_alpha(idx, alpha)
 
     def clear_all_snapshots(self):
         """Remove every snapshot from all canvases and reset the manager dialog."""
         self.canvas.clear_all_snapshots()
         self.single_det_canvas.clear_all_snapshots()
+        self.polar_canvas.clear_all_snapshots()
         if self.snapshot_manager is not None and self.snapshot_manager.isVisible():
             self.snapshot_manager.refresh([])
 
@@ -1439,7 +1475,7 @@ class MainWindow(QMainWindow):
         """Open (or bring to front) the snapshot manager dialog."""
         if self.snapshot_manager is None:
             self.snapshot_manager = SnapshotManagerDialog(self)
-        self.snapshot_manager.refresh(self._get_snapshot_labels())
+        self.snapshot_manager.refresh(self._get_snapshot_info())
         self.snapshot_manager.show()
         self.snapshot_manager.raise_()
         self.snapshot_manager.activateWindow()
