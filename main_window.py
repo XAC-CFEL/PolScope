@@ -18,9 +18,10 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout,
                               QTextEdit, QCheckBox, QScrollArea, QTabWidget,
                               QTableWidget, QTableWidgetItem, QHeaderView,
                               QComboBox, QRadioButton, QButtonGroup, QMessageBox,
-                              QDialog, QListWidget, QListWidgetItem)
+                              QDialog, QListWidget, QListWidgetItem,
+                              QColorDialog, QLineEdit)
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QColor
 
 from ToFPipeline.ToFPipeline import GlobalConfig, Calibrate
 
@@ -69,15 +70,25 @@ class SnapshotManagerDialog(QDialog):
             row_layout.setContentsMargins(4, 2, 4, 2)
             row_layout.setSpacing(4)
 
-            swatch = QLabel("  ")
-            swatch.setFixedWidth(14)
+            swatch = QPushButton()
+            swatch.setFixedWidth(20)
+            swatch.setFixedHeight(20)
+            swatch.setToolTip("Change color")
             swatch.setStyleSheet(f"background-color: {color}; border: 1px solid #888;")
+            swatch.clicked.connect(lambda _, idx=i, c=color: self._on_color(idx, c))
             row_layout.addWidget(swatch)
 
-            check = QCheckBox(label)
+            check = QCheckBox()
             check.setChecked(visible)
             check.toggled.connect(lambda checked, idx=i: self._on_visibility(idx, checked))
-            row_layout.addWidget(check, stretch=1)
+            row_layout.addWidget(check)
+
+            name_edit = QLineEdit(label)
+            name_edit.setPlaceholderText("name")
+            name_edit.editingFinished.connect(
+                lambda idx=i, w=name_edit: self._on_rename(idx, w.text().strip() or f"Snap {idx+1}")
+            )
+            row_layout.addWidget(name_edit, stretch=1)
 
             alpha_spin = QDoubleSpinBox()
             alpha_spin.setRange(0.05, 1.0)
@@ -106,6 +117,15 @@ class SnapshotManagerDialog(QDialog):
     def _on_alpha(self, idx, val):
         if self.parent() is not None:
             self.parent().set_snapshot_alpha(idx, val)
+
+    def _on_color(self, idx, current_color):
+        color = QColorDialog.getColor(QColor(current_color), self, "Pick Snapshot Color")
+        if color.isValid() and self.parent() is not None:
+            self.parent().set_snapshot_color(idx, color.name())
+
+    def _on_rename(self, idx, name):
+        if self.parent() is not None:
+            self.parent().rename_snapshot(idx, name)
 
     def _on_delete(self, idx):
         if self.parent() is not None:
@@ -1466,6 +1486,20 @@ class MainWindow(QMainWindow):
         self.canvas.set_snapshot_alpha(idx, alpha)
         self.single_det_canvas.set_snapshot_alpha(idx, alpha)
         self.polar_canvas.set_snapshot_alpha(idx, alpha)
+
+    def set_snapshot_color(self, idx, color):
+        """Change a snapshot's color on all canvases and refresh the manager."""
+        self.canvas.set_snapshot_color(idx, color)
+        self.single_det_canvas.set_snapshot_color(idx, color)
+        self.polar_canvas.set_snapshot_color(idx, color)
+        if self.snapshot_manager is not None and self.snapshot_manager.isVisible():
+            self.snapshot_manager.refresh(self._get_snapshot_info())
+
+    def rename_snapshot(self, idx, name):
+        """Rename a snapshot on all canvases (label only)."""
+        self.canvas.rename_snapshot(idx, name)
+        self.single_det_canvas.rename_snapshot(idx, name)
+        self.polar_canvas.rename_snapshot(idx, name)
 
     def clear_all_snapshots(self):
         """Remove every snapshot from all canvases and reset the manager dialog."""

@@ -141,6 +141,21 @@ class FastMplCanvas(FigureCanvasQTAgg):
             self.background = None
             self.draw_idle()
 
+    def set_snapshot_color(self, idx, color):
+        """Change a snapshot's color."""
+        if 0 <= idx < len(self.snapshots):
+            self.snapshots[idx]['color'] = color
+            for line in self.snapshots[idx]['lines']:
+                if line is not None:
+                    line.set_color(color)
+            self.background = None
+            self.draw_idle()
+
+    def rename_snapshot(self, idx, name):
+        """Rename a snapshot (label only, no visual change)."""
+        if 0 <= idx < len(self.snapshots):
+            self.snapshots[idx]['label'] = name
+
     def remove_snapshot(self, idx):
         """Remove a snapshot by index and force re-blit."""
         if 0 <= idx < len(self.snapshots):
@@ -463,6 +478,22 @@ class PolarPlotCanvas(FigureCanvasQTAgg):
             self.background = None
             self.last_fit_params = None
             self.draw_idle()
+
+    def set_snapshot_color(self, idx, color):
+        """Change a snapshot's color."""
+        if 0 <= idx < len(self.snapshots):
+            snap = self.snapshots[idx]
+            snap['color'] = color
+            snap['data_line'].set_color(color)
+            snap['fit_line'].set_color(color)
+            self.background = None
+            self.last_fit_params = None
+            self.draw_idle()
+
+    def rename_snapshot(self, idx, name):
+        """Rename a snapshot (label only, no visual change)."""
+        if 0 <= idx < len(self.snapshots):
+            self.snapshots[idx]['label'] = name
 
     def remove_snapshot(self, idx):
         """Remove a polar snapshot by index."""
@@ -968,6 +999,18 @@ class SingleDetectorCanvas(FigureCanvasQTAgg):
             self.snapshots[idx]['alpha'] = alpha
             self.snapshots[idx]['line'].set_alpha(alpha)
             self.draw_idle()
+
+    def set_snapshot_color(self, idx, color):
+        """Change a snapshot's color."""
+        if 0 <= idx < len(self.snapshots):
+            self.snapshots[idx]['color'] = color
+            self.snapshots[idx]['line'].set_color(color)
+            self.draw_idle()
+
+    def rename_snapshot(self, idx, name):
+        """Rename a snapshot (label only, no visual change)."""
+        if 0 <= idx < len(self.snapshots):
+            self.snapshots[idx]['label'] = name
 
     def remove_snapshot(self, idx):
         """Remove a snapshot by index."""
