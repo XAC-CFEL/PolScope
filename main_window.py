@@ -1325,7 +1325,11 @@ class MainWindow(QMainWindow):
         elif index == 1 and self.results_need_update:  # Results tab
             self.update_results_table()
             self.results_need_update = False
-        elif index == 2 and self.polar_needs_update:  # Polarization tab
+        elif index == 2:  # Polarization tab
+            # Reset cached blit background so the canvas redraws from scratch,
+            # preventing "burned in" artefacts from a stale background.
+            self.polar_canvas.background = None
+            self.polar_canvas.last_fit_params = None
             self.update_polar_plot()
             self.polar_needs_update = False
         elif index == 3 and self.heatmap_needs_update:  # Angular Heatmap tab
