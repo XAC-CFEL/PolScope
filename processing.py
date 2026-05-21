@@ -42,7 +42,7 @@ def process_detector_chunk(args):
 
         # Offset peak positions back to original sample coordinate space.
         results = pf.results
-        if results is not None and not results.empty and roi_start != 0:
+        if results is not None and hasattr(results, 'empty') and not results.empty and roi_start != 0:
             if "pos" in results.columns:
                 results["pos"] = results["pos"] + roi_start
 
