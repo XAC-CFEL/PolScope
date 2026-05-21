@@ -1109,7 +1109,7 @@ class MainWindow(QMainWindow):
 
             # Combine results
             if isinstance(self.stage_load['results'], list) and self.stage_load['results']:
-                non_empty = [r for r in self.stage_load['results'] if not r.empty]
+                non_empty = [r for r in self.stage_load['results'] if hasattr(r, 'empty') and not r.empty]
                 self.stage_load['results'] = pd.concat(non_empty, ignore_index=True) if non_empty else pd.DataFrame()
             elif isinstance(self.stage_load['results'], list):
                 self.stage_load['results'] = pd.DataFrame()
