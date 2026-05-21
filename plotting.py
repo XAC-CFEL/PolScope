@@ -415,9 +415,26 @@ class PolarPlotCanvas(FigureCanvasQTAgg):
         self.last_fit_params = None
 
     def init_blit(self):
-        """Initialize background for blitting"""
+        """Initialize background for blitting (live data artists excluded from background)."""
+        # Save and clear live artists so their current data doesn't bake into the background
+        theta_d, r_d = self.data_line.get_data()
+        theta_f, r_f = self.fit_line.get_data()
+        p1, q1 = self.phi_line1.get_data()
+        p2, q2 = self.phi_line2.get_data()
+        saved_text = self.fit_text.get_text()
+        self.data_line.set_data([], [])
+        self.fit_line.set_data([], [])
+        self.phi_line1.set_data([], [])
+        self.phi_line2.set_data([], [])
+        self.fit_text.set_text('')
         self.draw()
         self.background = self.copy_from_bbox(self.fig.bbox)
+        # Restore live artist data (will be redrawn by _redraw_artists on next update)
+        self.data_line.set_data(theta_d, r_d)
+        self.fit_line.set_data(theta_f, r_f)
+        self.phi_line1.set_data(p1, q1)
+        self.phi_line2.set_data(p2, q2)
+        self.fit_text.set_text(saved_text)
 
     def take_snapshot(self, alpha=0.3, label=None):
         """Capture the current polar data and fit as a static reference overlay."""
