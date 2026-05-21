@@ -29,7 +29,8 @@ from models import PlotData
 from data_ingestion import CircularBuffer, DataStreamSimulator, DoocspieStream
 from processing import process_detector_chunk, PerformanceMonitor, PlotPreparationWorker
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT
-from plotting import FastMplCanvas, PolarPlotCanvas, AngularHeatmapCanvas, SingleDetectorCanvas
+from plotting import FastMplCanvas, PolarPlotCanvas, AngularHeatmapCanvas, SingleDetectorCanvas, HistoryCanvas
+from history import HistoryBuffer
 
 
 class SnapshotManagerDialog(QDialog):
@@ -257,6 +258,70 @@ class MainWindow(QMainWindow):
         single_det_layout.addWidget(self.single_det_canvas)
         self.tab_widget.addTab(self.single_det_widget, "Single Detector")
 
+        # Tab 5: History
+        self.history_widget = QWidget()
+        history_outer_layout = QHBoxLayout(self.history_widget)
+
+        history_plot_widget = QWidget()
+        history_plot_layout = QVBoxLayout(history_plot_widget)
+        history_plot_layout.setContentsMargins(0, 0, 0, 0)
+        self.history_canvas = HistoryCanvas(self, width=10, height=8, dpi=100, n_detectors=16)
+        self.history_canvas.on_range_request = self._on_history_range_request
+        self.history_toolbar = NavigationToolbar2QT(self.history_canvas, history_plot_widget)
+        # Patch toolbar Home to re-enable auto-scrolling
+        _hc = self.history_canvas
+        _orig_h_home = self.history_toolbar.home
+        def _on_h_home(*args, **kwargs):
+            _hc.reset_view()
+            _orig_h_home(*args, **kwargs)
+        self.history_toolbar.home = _on_h_home
+        history_plot_layout.addWidget(self.history_toolbar)
+        history_plot_layout.addWidget(self.history_canvas)
+        history_outer_layout.addWidget(history_plot_widget, stretch=3)
+
+        # Controls panel
+        hist_ctrl_group = QGroupBox("History Controls")
+        hist_ctrl_layout = QGridLayout()
+        _row = 0
+        hist_ctrl_layout.addWidget(QLabel("Window (shots):"), _row, 0)
+        self.history_window_spin = QSpinBox()
+        self.history_window_spin.setRange(10, 10000)
+        self.history_window_spin.setValue(100)
+        self.history_window_spin.valueChanged.connect(self.update_history_plot)
+        hist_ctrl_layout.addWidget(self.history_window_spin, _row, 1)
+        _row += 1
+        hist_ctrl_layout.addWidget(QLabel("Peak No (pos/height):"), _row, 0)
+        self.history_peak_spin = QSpinBox()
+        self.history_peak_spin.setRange(0, 19)
+        self.history_peak_spin.setValue(0)
+        hist_ctrl_layout.addWidget(self.history_peak_spin, _row, 1)
+        _row += 1
+        reset_view_btn = QPushButton("Reset View")
+        reset_view_btn.clicked.connect(self.history_canvas.reset_view)
+        hist_ctrl_layout.addWidget(reset_view_btn, _row, 0, 1, 2)
+        _row += 1
+        flush_btn = QPushButton("Flush to File")
+        flush_btn.clicked.connect(lambda: self.history_buffer.flush_all())
+        hist_ctrl_layout.addWidget(flush_btn, _row, 0, 1, 2)
+        _row += 1
+        clear_hist_btn = QPushButton("Clear History")
+        clear_hist_btn.clicked.connect(self._clear_history)
+        hist_ctrl_layout.addWidget(clear_hist_btn, _row, 0, 1, 2)
+        _row += 1
+        self.history_status_label = QLabel("0 shots recorded")
+        self.history_status_label.setWordWrap(True)
+        hist_ctrl_layout.addWidget(self.history_status_label, _row, 0, 1, 2)
+        hist_ctrl_group.setLayout(hist_ctrl_layout)
+
+        hist_ctrl_outer = QWidget()
+        hist_ctrl_outer.setMaximumWidth(210)
+        hist_ctrl_outer_layout = QVBoxLayout(hist_ctrl_outer)
+        hist_ctrl_outer_layout.addWidget(hist_ctrl_group)
+        hist_ctrl_outer_layout.addStretch()
+        history_outer_layout.addWidget(hist_ctrl_outer, stretch=0)
+
+        self.tab_widget.addTab(self.history_widget, "History")
+
         # Connect tab change signal to update results when Results tab is selected
         self.tab_widget.currentChanged.connect(self.on_tab_changed)
 
@@ -273,6 +338,12 @@ class MainWindow(QMainWindow):
         self.polar_needs_update = False   # Flag for polar plot updates
         self.heatmap_needs_update = False  # Flag for angular heatmap updates
         self.single_det_needs_update = False  # Flag for single detector plot
+        self.history_needs_update = False  # Flag for history plot
+
+        # History buffer — keeps 1000 shots in RAM, dumps older records to CSV
+        self.history_buffer = HistoryBuffer(
+            dump_dir=Path(__file__).parent / 'history_data'
+        )
 
     def create_control_panel(self):
         """Create control panel"""
@@ -1005,6 +1076,12 @@ class MainWindow(QMainWindow):
         if self.snapshot_manager is not None and self.snapshot_manager.isVisible():
             self.snapshot_manager.refresh([])
 
+        # Reset history for the new session
+        self.history_canvas.set_n_detectors(self.n_detectors)
+        self.history_buffer.clear()
+        if hasattr(self, 'history_status_label'):
+            self.history_status_label.setText("0 shots recorded")
+
     def setup_workers(self):
         """Setup process pool and plotting workers"""
         # Shutdown existing process pool
@@ -1315,11 +1392,14 @@ class MainWindow(QMainWindow):
         else:
             self.plots_need_update = True
 
-        # Update polar plot if it's visible or flag for update
-        if self.tab_widget.currentIndex() == 2:  # Polarization tab
-            self.update_polar_plot()
-        else:
-            self.polar_needs_update = True
+        # Update polar plot — always called so last_fit_params stays current
+        # (drawing is skipped when the canvas is not visible, fit always runs)
+        self.update_polar_plot()
+        if self.tab_widget.currentIndex() != 2:
+            self.polar_needs_update = True   # force redraw on tab switch
+
+        # Record history (polar fit is now guaranteed to be fresh)
+        self.record_history()
 
         # Update heatmap if it's visible or flag for update
         if self.tab_widget.currentIndex() == 3:  # Angular Heatmap tab
@@ -1332,6 +1412,12 @@ class MainWindow(QMainWindow):
             self.update_single_detector_plot(plot_data_list)
         else:
             self.single_det_needs_update = True
+
+        # Update history canvas if visible or flag for update
+        if self.tab_widget.currentIndex() == 5:  # History tab
+            self.update_history_plot()
+        else:
+            self.history_needs_update = True
 
     def on_tab_changed(self, index):
         """Handle tab changes - update views when tabs are selected"""
@@ -1359,6 +1445,9 @@ class MainWindow(QMainWindow):
             if self.last_plot_data is not None:
                 self.update_single_detector_plot(self.last_plot_data)
             self.single_det_needs_update = False
+        elif index == 5 and self.history_needs_update:  # History tab
+            self.update_history_plot()
+            self.history_needs_update = False
 
     def _on_fit_mode_changed(self, btn_id, checked):
         """Switch which spinbox is active based on the fit-mode radio buttons"""
@@ -1642,7 +1731,82 @@ class MainWindow(QMainWindow):
             fitPhi=not fix_phi
         )
 
-    def update_results_table(self):
+    # ------------------------------------------------------------------
+    # History methods
+    # ------------------------------------------------------------------
+
+    def record_history(self):
+        """Record one shot of scalar values into the history buffer."""
+        if self.last_results_df is None or self.last_results_df.empty:
+            return
+
+        df = self.last_results_df
+        train_id = int(df['trainId'].iloc[-1]) if 'trainId' in df.columns else -1
+        record: dict = {'trainId': train_id}
+
+        # Fit params from polar canvas (always fresh with modified update_polar_plot)
+        fp = self.polar_canvas.last_fit_params
+        if fp is not None:
+            record['Plin'] = float(fp['Plin'])
+            record['phi']  = float(np.rad2deg(fp['phi']))
+            record['beta'] = float(fp['beta'])
+        else:
+            record['Plin'] = np.nan
+            record['phi']  = np.nan
+            record['beta'] = np.nan
+
+        # Per-detector peak position and height
+        peak_no = self.history_peak_spin.value()
+        peak_df = df[df['peakNo'] == peak_no]
+        for det_id in range(self.n_detectors):
+            det_rows = peak_df[peak_df['detector'] == det_id]
+            if not det_rows.empty:
+                record[f'pos_{det_id}']    = float(det_rows['pos'].mean())
+                record[f'height_{det_id}'] = float(det_rows['height'].mean())
+            else:
+                record[f'pos_{det_id}']    = np.nan
+                record[f'height_{det_id}'] = np.nan
+
+        self.history_buffer.append(record)
+
+        if hasattr(self, 'history_status_label'):
+            total = self.history_buffer.total_shots
+            dump = self.history_buffer.dump_file
+            dump_str = f"\nFile: {dump.name}" if dump else ""
+            self.history_status_label.setText(f"{total} shots recorded{dump_str}")
+
+    def update_history_plot(self):
+        """Refresh the history canvas with the latest buffered data."""
+        window = self.history_window_spin.value()
+        df = self.history_buffer.get_recent(max(window, 100))
+        if df.empty:
+            return
+        self.history_canvas.update_history(
+            df,
+            memory_start_shot=self.history_buffer.memory_start_shot,
+            enabled_detectors=self.enabled_detectors,
+            window=window,
+        )
+
+    def _on_history_range_request(self, shot_start: int, shot_end: int):
+        """Load shots from the CSV dump when the user pans beyond in-memory range."""
+        df = self.history_buffer.get_range(shot_start, shot_end)
+        if df.empty:
+            return
+        self.history_canvas.update_history(
+            df,
+            memory_start_shot=self.history_buffer.memory_start_shot,
+            enabled_detectors=self.enabled_detectors,
+            window=None,  # Don't change xlim — user is in manual-navigation mode
+        )
+
+    def _clear_history(self):
+        """Discard in-RAM history and start a fresh session."""
+        self.history_buffer.clear()
+        self.history_canvas.update_history(pd.DataFrame())
+        self.history_status_label.setText("0 shots recorded")
+
+
         """Update the results table with current results DataFrame"""
         if self.last_results_df is None or self.last_results_df.empty:
             self.results_table.setRowCount(0)

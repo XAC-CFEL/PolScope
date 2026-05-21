@@ -1,11 +1,12 @@
 import numpy as np
+import pandas as pd
 import matplotlib
 matplotlib.use('Qt5Agg')
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
 from matplotlib.collections import LineCollection
 from scipy.optimize import curve_fit
-from typing import List
+from typing import List, Optional
 
 from ToFPipeline.ToFPipeline import GlobalConfig, polarization_model, sepModel
 from colors import (COLOR_TRACE, COLOR_PEAK, COLOR_FWHM, COLOR_DATA,
@@ -202,9 +203,9 @@ class FastMplCanvas(FigureCanvasQTAgg):
         # Pre-compute shared y-range when requested (and not normalizing)
         if shared_y and not normalize:
             all_maxes = [
-                float(np.max(pd.values))
-                for pd in plot_data_list
-                if pd.has_data and pd.is_enabled and len(pd.values) > 0
+                float(np.max(pd_item.values))
+                for pd_item in plot_data_list
+                if pd_item.has_data and pd_item.is_enabled and len(pd_item.values) > 0
             ]
             global_max = max(all_maxes) if all_maxes else 1.0
             if global_max <= 0:
@@ -547,13 +548,15 @@ class PolarPlotCanvas(FigureCanvasQTAgg):
             setPhi: Fixed phi value in radians (used when fitPhi=False)
             fitPhi: If True, phi is a free fit parameter; if False, phi is fixed to setPhi
         """
-        if self.background is None:
-            self.init_blit()
+        visible = self.isVisible()
 
-        # Restore background
-        self.restore_region(self.background)
+        # Blitting operations only when the canvas is actually on screen
+        if visible:
+            if self.background is None:
+                self.init_blit()
+            self.restore_region(self.background)
 
-        # Clear previous data
+        # Clear previous data (artist property updates are always safe)
         self.data_line.set_data([], [])
         self.fit_line.set_data([], [])
         self.phi_line1.set_data([], [])
@@ -562,14 +565,16 @@ class PolarPlotCanvas(FigureCanvasQTAgg):
         self.last_fit_params = None
 
         if results_df is None or results_df.empty:
-            self._redraw_artists()
+            if visible:
+                self._redraw_artists()
             return
 
         # Filter by peak number
         peak_data = results_df[results_df['peakNo'] == peak_no]
 
         if peak_data.empty:
-            self._redraw_artists()
+            if visible:
+                self._redraw_artists()
             return
 
         # Get values for each detector
@@ -577,7 +582,8 @@ class PolarPlotCanvas(FigureCanvasQTAgg):
         detector_values = peak_data.groupby('detector')[value_type].mean()
 
         if detector_values.empty:
-            self._redraw_artists()
+            if visible:
+                self._redraw_artists()
             return
 
         # Get angles for available detectors
@@ -588,28 +594,29 @@ class PolarPlotCanvas(FigureCanvasQTAgg):
         available_detectors = available_detectors[valid_mask]
 
         if len(available_detectors) == 0:
-            self._redraw_artists()
+            if visible:
+                self._redraw_artists()
             return
 
         theta = self.angles_rad[available_detectors]
         r_values = detector_values.loc[available_detectors].values
 
-        # Update data points
+        # Update data points and radial limit (artist property updates, always safe)
         self.data_line.set_data(theta, r_values)
-
-        # Update radial limit based on data
         r_max = np.nanmax(r_values) * 1.2 if len(r_values) > 0 else 1.0
         self.ax.set_rlim(0, r_max)
 
-        # Fit polarization model if we have enough data points
+        # Fit polarization model — always run so last_fit_params stays current
         if len(theta) >= 3:
             try:
                 self._fit_and_plot(theta, r_values, beta, r_max, setPlin=setPlin, fitBeta=fitBeta, setPhi=setPhi, fitPhi=fitPhi)
             except Exception as e:
                 print(f"Fit error: {e}")
-                self.fit_text.set_text(f"Fit failed: {str(e)[:30]}")
+                if visible:
+                    self.fit_text.set_text(f"Fit failed: {str(e)[:30]}")
 
-        self._redraw_artists()
+        if visible:
+            self._redraw_artists()
 
     def _fit_and_plot(self, theta, r_values, beta, r_max, setPlin=None, fitBeta=False, setPhi=None, fitPhi=True):
         """Fit the polarization model and update plot"""
@@ -1159,3 +1166,199 @@ class SingleDetectorCanvas(FigureCanvasQTAgg):
                 snap['line'].set_data([], [])
 
         self.draw_idle()
+
+
+class HistoryCanvas(FigureCanvasQTAgg):
+    """Scrolling shot-history canvas.
+
+    Shows five stacked subplots (sharing the x-axis = shot number):
+      Plin | φ (°) | β | Peak position per detector | Peak height per detector
+
+    Auto-scrolls to the last *window* shots by default.  Once the user
+    zooms/pans manually (``_user_xlim = True``) the xlim is no longer
+    overridden, and if the view extends beyond what is in RAM
+    ``on_range_request(shot_start, shot_end)`` is called so the caller can
+    load older records from the dump file.
+
+    Call ``reset_view()`` (or patch the toolbar's Home button) to re-enable
+    auto-scrolling.
+    """
+
+    def __init__(self, parent=None, width=10, height=8, dpi=100, n_detectors=16):
+        self.fig = Figure(figsize=(width, height), dpi=dpi)
+        self.n_detectors = n_detectors
+
+        # Five subplots sharing the x-axis
+        self.ax_plin   = self.fig.add_subplot(5, 1, 1)
+        self.ax_phi    = self.fig.add_subplot(5, 1, 2, sharex=self.ax_plin)
+        self.ax_beta   = self.fig.add_subplot(5, 1, 3, sharex=self.ax_plin)
+        self.ax_pos    = self.fig.add_subplot(5, 1, 4, sharex=self.ax_plin)
+        self.ax_height = self.fig.add_subplot(5, 1, 5, sharex=self.ax_plin)
+
+        _labels = ['Plin', 'φ (°)', 'β', 'Pos.', 'Height']
+        for ax, lbl in zip(
+            [self.ax_plin, self.ax_phi, self.ax_beta, self.ax_pos, self.ax_height],
+            _labels,
+        ):
+            ax.set_ylabel(lbl, fontsize=8)
+            ax.grid(True, alpha=0.3)
+            ax.tick_params(labelsize=7)
+            ax.ticklabel_format(style='plain', useOffset=False)
+
+        self.ax_height.set_xlabel('Shot', fontsize=8)
+
+        # Global-fit lines (single line each)
+        (self.line_plin,)  = self.ax_plin.plot([], [], color='steelblue', linewidth=1.0)
+        (self.line_phi,)   = self.ax_phi.plot([], [], color='seagreen', linewidth=1.0)
+        (self.line_beta,)  = self.ax_beta.plot([], [], color='firebrick', linewidth=1.0)
+
+        # Per-detector lines for pos and height
+        self.lines_pos:    dict = {}
+        self.lines_height: dict = {}
+        self._build_det_lines()
+
+        self.fig.tight_layout(pad=0.5, h_pad=0.3)
+        super().__init__(self.fig)
+
+        # Callable invoked when the user pans/zooms into shots not in RAM.
+        # Signature: fn(shot_start: int, shot_end: int) -> None
+        self.on_range_request = None
+
+        self._memory_start_shot: int = 0
+        self._suppressing_xlim: bool = False
+        self._user_xlim:        bool = False
+
+        self.ax_plin.callbacks.connect('xlim_changed', self._on_xlim_changed)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _build_det_lines(self):
+        """(Re-)create per-detector Line2D objects for pos and height axes."""
+        for line in list(self.lines_pos.values()) + list(self.lines_height.values()):
+            try:
+                line.remove()
+            except Exception:
+                pass
+        self.lines_pos.clear()
+        self.lines_height.clear()
+
+        cmap = matplotlib.cm.tab20
+        n = max(self.n_detectors, 1)
+        for det_id in range(self.n_detectors):
+            color = cmap(det_id / n)
+            (lp,) = self.ax_pos.plot([], [], color=color, linewidth=0.8,
+                                     alpha=0.85, label=f'D{det_id}')
+            (lh,) = self.ax_height.plot([], [], color=color, linewidth=0.8,
+                                        alpha=0.85, label=f'D{det_id}')
+            self.lines_pos[det_id]    = lp
+            self.lines_height[det_id] = lh
+
+    # ------------------------------------------------------------------
+    # xlim callback — detects manual user zoom / pan
+    # ------------------------------------------------------------------
+
+    def _on_xlim_changed(self, ax):
+        if self._suppressing_xlim:
+            return
+        self._user_xlim = True
+        xlim = ax.get_xlim()
+        shot_start = int(np.floor(xlim[0]))
+        shot_end   = int(np.ceil(xlim[1]))
+        if shot_start < self._memory_start_shot and self.on_range_request is not None:
+            self.on_range_request(shot_start, shot_end)
+
+    def reset_view(self):
+        """Re-enable auto-scrolling (call after toolbar Home or a manual reset)."""
+        self._user_xlim = False
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def set_n_detectors(self, n: int):
+        """Rebuild per-detector lines when the detector count changes."""
+        self.n_detectors = n
+        self._build_det_lines()
+        self.draw_idle()
+
+    def update_history(
+        self,
+        df: pd.DataFrame,
+        memory_start_shot: int = 0,
+        enabled_detectors=None,
+        window: Optional[int] = 100,
+    ):
+        """Redraw all channels from *df* (columns: shot, Plin, phi, beta,
+        pos_N, height_N for each detector N).
+
+        *window*: when set and the user has not manually zoomed, the xlim
+        scrolls to show the last *window* shots.
+        """
+        if df is None or df.empty:
+            return
+
+        self._memory_start_shot = memory_start_shot
+        shots = df['shot'].values
+
+        def _upd(line, ax, col):
+            if col in df.columns:
+                line.set_data(shots, df[col].values.astype(float))
+            else:
+                line.set_data([], [])
+            ax.relim()
+            ax.autoscale_view(scalex=False, scaley=True)
+
+        _upd(self.line_plin,  self.ax_plin,  'Plin')
+        _upd(self.line_phi,   self.ax_phi,   'phi')
+        _upd(self.line_beta,  self.ax_beta,  'beta')
+
+        any_pos = any_height = False
+        for det_id in range(self.n_detectors):
+            show = enabled_detectors is None or det_id in enabled_detectors
+            lp = self.lines_pos.get(det_id)
+            lh = self.lines_height.get(det_id)
+            col_p = f'pos_{det_id}'
+            col_h = f'height_{det_id}'
+
+            if lp is not None:
+                if show and col_p in df.columns:
+                    lp.set_data(shots, df[col_p].values.astype(float))
+                    lp.set_visible(True)
+                    any_pos = True
+                else:
+                    lp.set_data([], [])
+                    lp.set_visible(False)
+
+            if lh is not None:
+                if show and col_h in df.columns:
+                    lh.set_data(shots, df[col_h].values.astype(float))
+                    lh.set_visible(True)
+                    any_height = True
+                else:
+                    lh.set_data([], [])
+                    lh.set_visible(False)
+
+        if any_pos:
+            self.ax_pos.relim()
+            self.ax_pos.autoscale_view(scalex=False, scaley=True)
+        if any_height:
+            self.ax_height.relim()
+            self.ax_height.autoscale_view(scalex=False, scaley=True)
+
+        # Auto-scroll when the user has not manually zoomed
+        if not self._user_xlim and shots.size > 0 and window is not None and window > 0:
+            xmax = float(shots[-1]) + 1.0
+            xmin = max(float(shots[0]) - 0.5, xmax - window)
+            self._suppressing_xlim = True
+            self.ax_plin.set_xlim(xmin, xmax)
+            self._suppressing_xlim = False
+
+        self.draw_idle()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.fig.tight_layout(pad=0.5, h_pad=0.3)
+        self.draw_idle()
+
