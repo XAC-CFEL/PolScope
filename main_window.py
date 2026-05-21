@@ -17,7 +17,8 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout,
                               QDoubleSpinBox, QGroupBox, QGridLayout, QFileDialog,
                               QTextEdit, QCheckBox, QScrollArea, QTabWidget,
                               QTableWidget, QTableWidgetItem, QHeaderView,
-                              QComboBox, QRadioButton, QButtonGroup, QMessageBox)
+                              QComboBox, QRadioButton, QButtonGroup, QMessageBox,
+                              QDialog, QListWidget, QListWidgetItem)
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot
 from PyQt6.QtGui import QFont
 
@@ -28,6 +29,66 @@ from data_ingestion import CircularBuffer, DataStreamSimulator, DoocspieStream
 from processing import process_detector_chunk, PerformanceMonitor, PlotPreparationWorker
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT
 from plotting import FastMplCanvas, PolarPlotCanvas, AngularHeatmapCanvas, SingleDetectorCanvas
+
+
+class SnapshotManagerDialog(QDialog):
+    """Floating dialog for managing reference snapshots across all plot canvases."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Snapshot Manager")
+        self.setWindowFlags(
+            Qt.WindowType.Window |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.WindowCloseButtonHint
+        )
+        self.resize(300, 240)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Snapshots — check to show, click to select:"))
+
+        self.list_widget = QListWidget()
+        self.list_widget.itemChanged.connect(self._on_item_changed)
+        layout.addWidget(self.list_widget)
+
+        btn_row = QHBoxLayout()
+        del_btn = QPushButton("Delete Selected")
+        del_btn.clicked.connect(self._delete_selected)
+        btn_row.addWidget(del_btn)
+        clear_btn = QPushButton("Clear All")
+        clear_btn.clicked.connect(self._clear_all)
+        btn_row.addWidget(clear_btn)
+        layout.addLayout(btn_row)
+
+    def refresh(self, snapshot_labels):
+        """Rebuild the list from [(label, visible), ...] pairs."""
+        self.list_widget.blockSignals(True)
+        self.list_widget.clear()
+        for i, (label, visible) in enumerate(snapshot_labels):
+            item = QListWidgetItem(label)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if visible else Qt.CheckState.Unchecked)
+            item.setData(Qt.ItemDataRole.UserRole, i)
+            self.list_widget.addItem(item)
+        self.list_widget.blockSignals(False)
+
+    def _on_item_changed(self, item):
+        idx = item.data(Qt.ItemDataRole.UserRole)
+        visible = item.checkState() == Qt.CheckState.Checked
+        if self.parent() is not None:
+            self.parent().set_snapshot_visible(idx, visible)
+
+    def _delete_selected(self):
+        items = self.list_widget.selectedItems()
+        if not items:
+            return
+        idx = items[0].data(Qt.ItemDataRole.UserRole)
+        if self.parent() is not None:
+            self.parent().remove_snapshot(idx)
+
+    def _clear_all(self):
+        if self.parent() is not None:
+            self.parent().clear_all_snapshots()
 
 
 class MainWindow(QMainWindow):
@@ -66,6 +127,9 @@ class MainWindow(QMainWindow):
 
         # Intensity calibration coefficients (int det_id -> float coeff)
         self.calib_coefficients = {}
+
+        # Snapshot manager dialog (created on demand)
+        self.snapshot_manager = None
 
         # Setup UI
         self.setup_ui()
@@ -593,6 +657,32 @@ class MainWindow(QMainWindow):
         calib_group.setLayout(calib_layout)
         layout.addWidget(calib_group)
 
+        # Snapshots
+        snap_group = QGroupBox("Reference Snapshots")
+        snap_layout = QGridLayout()
+
+        snap_layout.addWidget(QLabel("Alpha:"), 0, 0)
+        self.snapshot_alpha_spin = QDoubleSpinBox()
+        self.snapshot_alpha_spin.setRange(0.05, 1.0)
+        self.snapshot_alpha_spin.setSingleStep(0.05)
+        self.snapshot_alpha_spin.setDecimals(2)
+        self.snapshot_alpha_spin.setValue(0.3)
+        self.snapshot_alpha_spin.setToolTip("Opacity of the snapshot reference lines")
+        snap_layout.addWidget(self.snapshot_alpha_spin, 0, 1)
+
+        take_snap_btn = QPushButton("Take Snapshot")
+        take_snap_btn.clicked.connect(self.take_snapshot)
+        take_snap_btn.setToolTip("Freeze current spectra as a static reference overlay")
+        snap_layout.addWidget(take_snap_btn, 1, 0, 1, 2)
+
+        manage_snap_btn = QPushButton("Manage Snapshots")
+        manage_snap_btn.clicked.connect(self.show_snapshot_manager)
+        manage_snap_btn.setToolTip("Toggle visibility or delete individual snapshots")
+        snap_layout.addWidget(manage_snap_btn, 2, 0, 1, 2)
+
+        snap_group.setLayout(snap_layout)
+        layout.addWidget(snap_group)
+
         # Control buttons
         btn_group = QGroupBox("Control")
         btn_layout = QVBoxLayout()
@@ -863,6 +953,11 @@ class MainWindow(QMainWindow):
             self.single_det_combo.addItem(f"Det {i}")
         self.single_det_combo.setCurrentIndex(min(current_det, self.n_detectors - 1))
         self.single_det_combo.blockSignals(False)
+
+        # Clear snapshots from the old canvas and reset manager
+        self.single_det_canvas.clear_all_snapshots()
+        if self.snapshot_manager is not None and self.snapshot_manager.isVisible():
+            self.snapshot_manager.refresh([])
 
     def setup_workers(self):
         """Setup process pool and plotting workers"""
@@ -1283,7 +1378,8 @@ class MainWindow(QMainWindow):
         self.single_det_canvas.update_plot(
             plot_data,
             show_baseline=self.show_baseline_check.isChecked(),
-            normalize=self.normalize_check.isChecked()
+            normalize=self.normalize_check.isChecked(),
+            det_idx=det_idx
         )
 
     def on_single_det_changed(self, index):
@@ -1297,6 +1393,56 @@ class MainWindow(QMainWindow):
         """Clear the circular buffer"""
         if self.circular_buffer is not None:
             self.circular_buffer.clear()
+
+    # ------------------------------------------------------------------ #
+    # Snapshot helpers                                                      #
+    # ------------------------------------------------------------------ #
+
+    def _get_snapshot_labels(self):
+        """Return [(label, visible), ...] from the main canvas snapshot list."""
+        return [(s['label'], s['visible']) for s in self.canvas.snapshots]
+
+    def take_snapshot(self):
+        """Freeze the current plot data as a static reference overlay on all canvases."""
+        if self.last_plot_data is None:
+            return
+        alpha = self.snapshot_alpha_spin.value()
+        det_idx = self.single_det_combo.currentIndex()
+        self.canvas.take_snapshot(self.last_plot_data, alpha=alpha)
+        self.single_det_canvas.take_snapshot(
+            self.last_plot_data, alpha=alpha,
+            current_det_idx=max(det_idx, 0)
+        )
+        if self.snapshot_manager is not None and self.snapshot_manager.isVisible():
+            self.snapshot_manager.refresh(self._get_snapshot_labels())
+
+    def remove_snapshot(self, idx):
+        """Remove snapshot at *idx* from all canvases and refresh the manager dialog."""
+        self.canvas.remove_snapshot(idx)
+        self.single_det_canvas.remove_snapshot(idx)
+        if self.snapshot_manager is not None and self.snapshot_manager.isVisible():
+            self.snapshot_manager.refresh(self._get_snapshot_labels())
+
+    def set_snapshot_visible(self, idx, visible):
+        """Toggle snapshot visibility on all canvases."""
+        self.canvas.set_snapshot_visible(idx, visible)
+        self.single_det_canvas.set_snapshot_visible(idx, visible)
+
+    def clear_all_snapshots(self):
+        """Remove every snapshot from all canvases and reset the manager dialog."""
+        self.canvas.clear_all_snapshots()
+        self.single_det_canvas.clear_all_snapshots()
+        if self.snapshot_manager is not None and self.snapshot_manager.isVisible():
+            self.snapshot_manager.refresh([])
+
+    def show_snapshot_manager(self):
+        """Open (or bring to front) the snapshot manager dialog."""
+        if self.snapshot_manager is None:
+            self.snapshot_manager = SnapshotManagerDialog(self)
+        self.snapshot_manager.refresh(self._get_snapshot_labels())
+        self.snapshot_manager.show()
+        self.snapshot_manager.raise_()
+        self.snapshot_manager.activateWindow()
 
     def load_calibration_file(self):
         """Open a calib.yaml and load per-detector transmission coefficients"""

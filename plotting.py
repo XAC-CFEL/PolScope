@@ -16,6 +16,15 @@ _COLOR_BASELINE = '#228833'   # Tol green — dashed baseline endpoints
 _COLOR_ADJUSTED = '#228833'   # Tol green dotted — baseline-adjusted trace
 _MAX_BASELINE_PEAKS = 5       # max pre-created artists per detector
 
+# Cycling palette for snapshot reference lines
+_SNAPSHOT_COLORS = [
+    '#CC79A7',  # reddish purple
+    '#009E73',  # bluish green
+    '#E69F00',  # orange
+    '#F0E442',  # yellow
+    '#000000',  # black
+]
+
 
 class FastMplCanvas(FigureCanvasQTAgg):
     """Matplotlib canvas optimized for fast updates using blitting"""
@@ -88,12 +97,73 @@ class FastMplCanvas(FigureCanvasQTAgg):
         # Background for blitting
         self.background = None
 
+        # Snapshot reference lines — list of dicts:
+        #   {'label': str, 'alpha': float, 'visible': bool, 'lines': [Line2D|None, ...]}
+        self.snapshots = []
+
     def resizeEvent(self, event):
         """Handle resize events to redraw plots properly"""
         super().resizeEvent(event)
         # Reset background on resize so blitting works correctly
         self.background = None
         self.fig.tight_layout()
+        self.draw_idle()
+
+    def take_snapshot(self, plot_data_list, alpha=0.3, label=None):
+        """Capture current plot data as a static reference background line per subplot."""
+        color = _SNAPSHOT_COLORS[len(self.snapshots) % len(_SNAPSHOT_COLORS)]
+        if label is None:
+            label = f"Snap {len(self.snapshots) + 1}"
+        snap_lines = []
+        for i, plot_data in enumerate(plot_data_list):
+            if i >= len(self.axes):
+                snap_lines.append(None)
+                continue
+            ax = self.axes[i]
+            if plot_data.has_data and plot_data.is_enabled and len(plot_data.samples) > 0:
+                (line,) = ax.plot(plot_data.samples, plot_data.values,
+                                  color=color, linewidth=0.8, alpha=alpha, zorder=1.5)
+            else:
+                (line,) = ax.plot([], [], color=color, linewidth=0.8, alpha=alpha, zorder=1.5)
+            snap_lines.append(line)
+        self.snapshots.append({'label': label, 'alpha': alpha, 'visible': True, 'lines': snap_lines})
+        self.background = None
+        self.draw_idle()
+
+    def remove_snapshot(self, idx):
+        """Remove a snapshot by index and force re-blit."""
+        if 0 <= idx < len(self.snapshots):
+            for line in self.snapshots[idx]['lines']:
+                if line is not None:
+                    try:
+                        line.remove()
+                    except ValueError:
+                        pass
+            self.snapshots.pop(idx)
+            self.background = None
+            self.draw_idle()
+
+    def set_snapshot_visible(self, idx, visible):
+        """Toggle a snapshot's visibility and force re-blit."""
+        if 0 <= idx < len(self.snapshots):
+            self.snapshots[idx]['visible'] = visible
+            for line in self.snapshots[idx]['lines']:
+                if line is not None:
+                    line.set_visible(visible)
+            self.background = None
+            self.draw_idle()
+
+    def clear_all_snapshots(self):
+        """Remove all snapshots."""
+        for snap in self.snapshots:
+            for line in snap['lines']:
+                if line is not None:
+                    try:
+                        line.remove()
+                    except ValueError:
+                        pass
+        self.snapshots.clear()
+        self.background = None
         self.draw_idle()
 
     def init_blit(self):
@@ -769,12 +839,60 @@ class SingleDetectorCanvas(FigureCanvasQTAgg):
         # _user_navigated: set to True when user zooms/pans so we stop overriding limits
         self._user_navigated = False
 
+        # Snapshot reference lines — list of dicts:
+        #   {'label': str, 'alpha': float, 'visible': bool,
+        #    'line': Line2D, 'plot_data_list': List[PlotData]}
+        self.snapshots = []
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.fig.tight_layout(pad=1.5)
         self.draw_idle()
 
-    def update_plot(self, plot_data: PlotData, show_baseline: bool = True, normalize: bool = True):
+    def take_snapshot(self, plot_data_list, alpha=0.3, label=None, current_det_idx=0):
+        """Capture plot data as a static reference line for the active detector."""
+        color = _SNAPSHOT_COLORS[len(self.snapshots) % len(_SNAPSHOT_COLORS)]
+        if label is None:
+            label = f"Snap {len(self.snapshots) + 1}"
+        (line,) = self.ax.plot([], [], color=color, linewidth=0.8, alpha=alpha, zorder=1.5)
+        if current_det_idx < len(plot_data_list):
+            pd_snap = plot_data_list[current_det_idx]
+            if pd_snap.has_data and pd_snap.is_enabled and len(pd_snap.samples) > 0:
+                line.set_data(pd_snap.samples, pd_snap.values)
+        self.snapshots.append({
+            'label': label, 'alpha': alpha, 'visible': True,
+            'line': line, 'plot_data_list': list(plot_data_list)
+        })
+        self.draw_idle()
+
+    def remove_snapshot(self, idx):
+        """Remove a snapshot by index."""
+        if 0 <= idx < len(self.snapshots):
+            try:
+                self.snapshots[idx]['line'].remove()
+            except ValueError:
+                pass
+            self.snapshots.pop(idx)
+            self.draw_idle()
+
+    def set_snapshot_visible(self, idx, visible):
+        """Toggle a snapshot's visibility."""
+        if 0 <= idx < len(self.snapshots):
+            self.snapshots[idx]['visible'] = visible
+            self.snapshots[idx]['line'].set_visible(visible)
+            self.draw_idle()
+
+    def clear_all_snapshots(self):
+        """Remove all snapshots."""
+        for snap in self.snapshots:
+            try:
+                snap['line'].remove()
+            except ValueError:
+                pass
+        self.snapshots.clear()
+        self.draw_idle()
+
+    def update_plot(self, plot_data: PlotData, show_baseline: bool = True, normalize: bool = True, det_idx: int = 0):
         """Update the canvas with data for a single detector"""
         if plot_data is None or not plot_data.has_data:
             self.line.set_data([], [])
@@ -851,5 +969,17 @@ class SingleDetectorCanvas(FigureCanvasQTAgg):
             self.baseline_lc.set_segments([])
             for al in self.adj_lines:
                 al.set_data([], [])
+
+        # Update snapshot lines for the active detector
+        for snap in self.snapshots:
+            pdl = snap['plot_data_list']
+            if det_idx < len(pdl):
+                pd_snap = pdl[det_idx]
+                if pd_snap.has_data and pd_snap.is_enabled and len(pd_snap.samples) > 0:
+                    snap['line'].set_data(pd_snap.samples, pd_snap.values)
+                else:
+                    snap['line'].set_data([], [])
+            else:
+                snap['line'].set_data([], [])
 
         self.draw_idle()
