@@ -1,10 +1,25 @@
+"""
+Pyqtgraph-based plotting canvases.
+
+Replaces the original matplotlib/blitting implementation.  Public API is kept
+identical so main_window.py requires only small changes (removing the
+matplotlib NavigationToolbar import/usage and a direct .ax.set_title call).
+
+Performance notes
+-----------------
+* No manual blitting -- pyqtgraph uses an OpenGL (or optimised software)
+  back-end that is intrinsically incremental.
+* ``fast_update`` just calls ``setData`` on pre-existing items; the Qt event
+  loop coalesces all pending paints into a single GPU flush.
+* ``background`` and ``init_blit`` are kept as no-ops for API compatibility.
+"""
+
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use('Qt5Agg')
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT
-from matplotlib.figure import Figure
-from matplotlib.collections import LineCollection
+import pyqtgraph as pg
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColor
+from PyQt6.QtWidgets import QWidget
 from scipy.optimize import curve_fit
 from typing import List, Optional
 
@@ -13,11 +28,16 @@ from colors import (COLOR_TRACE, COLOR_PEAK, COLOR_FWHM, COLOR_DATA,
                     COLOR_FIT, COLOR_PHI, COLOR_DISABLED, COLOR_GRAY)
 from models import PlotData
 
-_COLOR_BASELINE = '#228833'   # Tol green — dashed baseline endpoints
-_COLOR_ADJUSTED = '#228833'   # Tol green dotted — baseline-adjusted trace
-_MAX_BASELINE_PEAKS = 5       # max pre-created artists per detector
+# Global pyqtgraph config — white background, black foreground, antialiased
+# useOpenGL=False prevents STATUS_FATAL_USER_CALLBACK_EXCEPTION (0xC000041D)
+# crashes on Windows systems without a suitable OpenGL driver.
+pg.setConfigOptions(antialias=True, background='w', foreground='k',
+                    useOpenGL=False)
 
-# Cycling palette for snapshot reference lines
+_COLOR_BASELINE = '#228833'   # green dashed baseline
+_COLOR_ADJUSTED = '#228833'   # green dotted adjusted trace
+_MAX_BASELINE_PEAKS = 5       # pre-created adjusted-trace items per detector
+
 _SNAPSHOT_COLORS = [
     '#CC79A7',  # reddish purple
     '#009E73',  # bluish green
@@ -26,186 +46,216 @@ _SNAPSHOT_COLORS = [
     '#000000',  # black
 ]
 
+# 16 distinct colours (tab20 first 16) for per-detector history lines
+_DET_PALETTE = [
+    '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+    '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
+    '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5',
+    '#c49c94',
+]
 
-class FastMplCanvas(FigureCanvasQTAgg):
-    """Matplotlib canvas optimized for fast updates using blitting"""
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+def _pen(color: str, width: float = 1.0,
+         style: Qt.PenStyle = Qt.PenStyle.SolidLine,
+         alpha: int = 255) -> pg.QtGui.QPen:
+    c = QColor(color)
+    c.setAlpha(alpha)
+    return pg.mkPen(c, width=width, style=style)
+
+
+def _brush(color: str, alpha: int = 255) -> pg.QtGui.QBrush:
+    c = QColor(color)
+    c.setAlpha(alpha)
+    return pg.mkBrush(c)
+
+
+def _snap_pen(color: str, alpha: float) -> pg.QtGui.QPen:
+    """Return a pen for snapshot lines respecting fractional alpha."""
+    return _pen(color, width=0.8, alpha=int(alpha * 255))
+
+
+# ---------------------------------------------------------------------------
+# FastMplCanvas — 16-detector grid
+# ---------------------------------------------------------------------------
+
+class FastMplCanvas(pg.GraphicsLayoutWidget):
+    """Pyqtgraph grid canvas replacing the original matplotlib blitting canvas."""
 
     def __init__(self, parent=None, width=5, height=4, dpi=100, n_detectors=16):
-        self.fig = Figure(figsize=(width, height), dpi=dpi)
-        self.axes = []
+        super().__init__(parent=parent)
+        self.setViewport(QWidget())  # force software rendering (no OpenGL)
         self.n_detectors = n_detectors
+        # Compatibility stubs — these attributes are written from main_window.py
+        self.background = None
 
-        # Calculate grid dimensions
         n_cols = int(np.ceil(np.sqrt(n_detectors)))
-        n_rows = int(np.ceil(n_detectors / n_cols))
 
-        # Create subplots
+        self.plots: List[pg.PlotItem] = []
+        self.curves: List[pg.PlotDataItem] = []
+        self.scatter_items: List[pg.ScatterPlotItem] = []
+        self.fwhm_curves: List[pg.PlotDataItem] = []
+        self.baseline_curves: List[pg.PlotDataItem] = []
+        self.adj_curves: List[List[pg.PlotDataItem]] = []
+        self.text_items: List[pg.TextItem] = []
+
         for i in range(n_detectors):
-            ax = self.fig.add_subplot(n_rows, n_cols, i + 1)
-            ax.grid(True, alpha=0.3)
-            ax.set_title(f'Det {i}', fontsize=8)
-            ax.tick_params(labelsize=6)
-            ax.set_ylim([-0.1, 1.1])
-            ax.set_xlim([0, 1000])  # Initial range, will be updated with real data
-            # Format x-axis to show sample coordinates as plain numbers
-            ax.ticklabel_format(style='plain', axis='x', useOffset=False)
-            ax.xaxis.get_major_formatter().set_scientific(False)
-            self.axes.append(ax)
+            row = i // n_cols
+            col = i % n_cols
+            p = self.addPlot(row=row, col=col)
+            p.setTitle(f'Det {i}')
+            p.showGrid(x=True, y=True, alpha=0.3)
+            p.setYRange(-0.1, 1.1, padding=0)
+            p.setXRange(0, 1000, padding=0)
+            p.hideButtons()
+            self.plots.append(p)
 
-        self.fig.tight_layout()
-        super().__init__(self.fig)
+            curve = p.plot([], [], pen=_pen(COLOR_TRACE, width=0.5))
+            self.curves.append(curve)
 
-        # Objects for fast updates
-        self.lines = []
-        self.scatters = []
-        self.text_objects = []
-        self.fwhm_lines = []      # LineCollection for FWHM horizontal lines
-        self.baseline_lcs = []    # LineCollection for baseline dashed segments
-        self.adjusted_lines = []  # List[List[Line2D]] for baseline-adjusted traces
+            scatter = pg.ScatterPlotItem(size=5, pen=None, brush=_brush(COLOR_PEAK))
+            p.addItem(scatter)
+            self.scatter_items.append(scatter)
 
-        # Initialize plot objects
-        for ax in self.axes:
-            line, = ax.plot([], [], color=COLOR_TRACE, linewidth=0.5, alpha=0.8)
-            self.lines.append(line)
+            # FWHM — multiple horizontal segments encoded as connect='pairs'
+            fwhm = pg.PlotDataItem([], [], pen=_pen(COLOR_FWHM, width=1.5),
+                                   connect='pairs')
+            p.addItem(fwhm)
+            self.fwhm_curves.append(fwhm)
 
-            scatter = ax.scatter([], [], color=COLOR_PEAK, s=20, zorder=5)
-            self.scatters.append(scatter)
+            # Baseline — dashed green segments
+            baseline = pg.PlotDataItem(
+                [], [],
+                pen=_pen(_COLOR_BASELINE, width=1.2, style=Qt.PenStyle.DashLine),
+                connect='pairs')
+            p.addItem(baseline)
+            self.baseline_curves.append(baseline)
 
-            text = ax.text(0.5, 0.5, '', ha='center', va='center',
-                           transform=ax.transAxes, fontsize=10, color=COLOR_GRAY)
-            text.set_visible(False)
-            self.text_objects.append(text)
-
-            # LineCollection for FWHM lines (horizontal lines at half height)
-            fwhm_lc = LineCollection([], colors=COLOR_FWHM, linewidths=1.5, zorder=4)
-            ax.add_collection(fwhm_lc)
-            self.fwhm_lines.append(fwhm_lc)
-
-            # Baseline artists (green dashed segment between baseline endpoints)
-            baseline_lc = LineCollection([], colors=_COLOR_BASELINE, linewidths=1.2,
-                                          linestyles='dashed', zorder=3)
-            ax.add_collection(baseline_lc)
-            self.baseline_lcs.append(baseline_lc)
-
-            # Baseline-adjusted trace lines (one per possible peak)
-            adj_lines_for_det = []
+            # Baseline-adjusted traces
+            adj_list: List[pg.PlotDataItem] = []
             for _ in range(_MAX_BASELINE_PEAKS):
-                adj_line, = ax.plot([], [], color=_COLOR_ADJUSTED, linestyle='dotted',
-                                    linewidth=1.0, alpha=0.7, zorder=3)
-                adj_lines_for_det.append(adj_line)
-            self.adjusted_lines.append(adj_lines_for_det)
+                adj = p.plot([], [],
+                             pen=_pen(_COLOR_ADJUSTED, width=1.0,
+                                      style=Qt.PenStyle.DotLine, alpha=178))
+                adj_list.append(adj)
+            self.adj_curves.append(adj_list)
 
-        # Background for blitting
-        self.background = None
+            # Overlay text (N/A, OFF)
+            text = pg.TextItem('', color=COLOR_GRAY, anchor=(0.5, 0.5))
+            text.setVisible(False)
+            p.addItem(text)
+            self.text_items.append(text)
 
-        # Snapshot reference lines — list of dicts:
-        #   {'label': str, 'alpha': float, 'visible': bool, 'lines': [Line2D|None, ...]}
-        self.snapshots = []
+        self.snapshots: List[dict] = []
 
-    def resizeEvent(self, event):
-        """Handle resize events to redraw plots properly"""
-        super().resizeEvent(event)
-        # Reset background on resize so blitting works correctly
-        self.background = None
-        self.fig.tight_layout()
-        self.draw_idle()
+    # ------------------------------------------------------------------ #
+    # Compatibility stubs                                                   #
+    # ------------------------------------------------------------------ #
 
-    def take_snapshot(self, plot_data_list, alpha=0.3, label=None):
-        """Capture current plot data as a static reference background line per subplot."""
+    def init_blit(self):
+        """No-op — pyqtgraph does not need explicit blit initialisation."""
+
+    # ------------------------------------------------------------------ #
+    # Internal helpers                                                      #
+    # ------------------------------------------------------------------ #
+
+    def _show_overlay(self, i: int, msg: str, color: str, bg: str = 'white'):
+        p = self.plots[i]
+        p.setXRange(0, 1000, padding=0)
+        p.setYRange(-0.1, 1.1, padding=0)
+        t = self.text_items[i]
+        t.setPos(500.0, 0.5)
+        t.setText(msg)
+        t.setColor(QColor(color))
+        t.setVisible(True)
+        p.getViewBox().setBackgroundColor(QColor(bg))
+
+    def _hide_overlay(self, i: int):
+        self.text_items[i].setVisible(False)
+        self.plots[i].getViewBox().setBackgroundColor(QColor('white'))
+
+    # ------------------------------------------------------------------ #
+    # Snapshot API                                                          #
+    # ------------------------------------------------------------------ #
+
+    def take_snapshot(self, plot_data_list, alpha: float = 0.3, label=None):
         color = _SNAPSHOT_COLORS[len(self.snapshots) % len(_SNAPSHOT_COLORS)]
         if label is None:
             label = f"Snap {len(self.snapshots) + 1}"
-        snap_lines = []
-        for i, plot_data in enumerate(plot_data_list):
-            if i >= len(self.axes):
+        snap_lines: List[Optional[pg.PlotDataItem]] = []
+        for i, pd_item in enumerate(plot_data_list):
+            if i >= len(self.plots):
                 snap_lines.append(None)
                 continue
-            ax = self.axes[i]
-            if plot_data.has_data and plot_data.is_enabled and len(plot_data.samples) > 0:
-                (line,) = ax.plot(plot_data.samples, plot_data.values,
-                                  color=color, linewidth=0.8, alpha=alpha, zorder=1.5)
-            else:
-                (line,) = ax.plot([], [], color=color, linewidth=0.8, alpha=alpha, zorder=1.5)
+            line = self.plots[i].plot([], [], pen=_snap_pen(color, alpha))
+            if pd_item.has_data and pd_item.is_enabled and len(pd_item.samples) > 0:
+                line.setData(pd_item.samples, pd_item.values)
             snap_lines.append(line)
-        self.snapshots.append({'label': label, 'alpha': alpha, 'visible': True,
-                               'lines': snap_lines, 'color': color})
-        self.background = None
-        self.draw_idle()
+        self.snapshots.append({
+            'label': label, 'alpha': alpha, 'visible': True,
+            'color': color, 'lines': snap_lines,
+        })
 
-    def set_snapshot_alpha(self, idx, alpha):
-        """Change a snapshot's alpha without removing it."""
+    def set_snapshot_alpha(self, idx: int, alpha: float):
         if 0 <= idx < len(self.snapshots):
-            self.snapshots[idx]['alpha'] = alpha
-            for line in self.snapshots[idx]['lines']:
+            snap = self.snapshots[idx]
+            snap['alpha'] = alpha
+            p = _snap_pen(snap['color'], alpha)
+            for line in snap['lines']:
                 if line is not None:
-                    line.set_alpha(alpha)
-            self.background = None
-            self.draw_idle()
+                    line.setPen(p)
 
-    def set_snapshot_color(self, idx, color):
-        """Change a snapshot's color."""
+    def set_snapshot_color(self, idx: int, color: str):
         if 0 <= idx < len(self.snapshots):
-            self.snapshots[idx]['color'] = color
-            for line in self.snapshots[idx]['lines']:
+            snap = self.snapshots[idx]
+            snap['color'] = color
+            p = _snap_pen(color, snap['alpha'])
+            for line in snap['lines']:
                 if line is not None:
-                    line.set_color(color)
-            self.background = None
-            self.draw_idle()
+                    line.setPen(p)
 
-    def rename_snapshot(self, idx, name):
-        """Rename a snapshot (label only, no visual change)."""
+    def rename_snapshot(self, idx: int, name: str):
         if 0 <= idx < len(self.snapshots):
             self.snapshots[idx]['label'] = name
 
-    def remove_snapshot(self, idx):
-        """Remove a snapshot by index and force re-blit."""
+    def remove_snapshot(self, idx: int):
         if 0 <= idx < len(self.snapshots):
-            for line in self.snapshots[idx]['lines']:
-                if line is not None:
-                    try:
-                        line.remove()
-                    except ValueError:
-                        pass
-            self.snapshots.pop(idx)
-            self.background = None
-            self.draw_idle()
+            snap = self.snapshots.pop(idx)
+            for i, line in enumerate(snap['lines']):
+                if line is not None and i < len(self.plots):
+                    self.plots[i].removeItem(line)
 
-    def set_snapshot_visible(self, idx, visible):
-        """Toggle a snapshot's visibility and force re-blit."""
+    def set_snapshot_visible(self, idx: int, visible: bool):
         if 0 <= idx < len(self.snapshots):
             self.snapshots[idx]['visible'] = visible
             for line in self.snapshots[idx]['lines']:
                 if line is not None:
-                    line.set_visible(visible)
-            self.background = None
-            self.draw_idle()
+                    line.setVisible(visible)
 
     def clear_all_snapshots(self):
-        """Remove all snapshots."""
         for snap in self.snapshots:
-            for line in snap['lines']:
-                if line is not None:
-                    try:
-                        line.remove()
-                    except ValueError:
-                        pass
+            for i, line in enumerate(snap['lines']):
+                if line is not None and i < len(self.plots):
+                    self.plots[i].removeItem(line)
         self.snapshots.clear()
-        self.background = None
-        self.draw_idle()
 
-    def init_blit(self):
-        """Initialize background for blitting"""
-        self.draw()
-        self.background = self.copy_from_bbox(self.fig.bbox)
+    # ------------------------------------------------------------------ #
+    # Main update                                                           #
+    # ------------------------------------------------------------------ #
 
-    def fast_update(self, plot_data_list: List[PlotData], show_baseline: bool = True, normalize: bool = True, shared_y: bool = False):
-        """Fast update using blitting"""
-        # Pre-compute shared y-range when requested (and not normalizing)
+    def fast_update(self, plot_data_list: List[PlotData],
+                    show_baseline: bool = True,
+                    normalize: bool = True,
+                    shared_y: bool = False):
+        # Pre-compute shared y-range when requested (non-normalised mode)
         if shared_y and not normalize:
             all_maxes = [
-                float(np.max(pd_item.values))
-                for pd_item in plot_data_list
-                if pd_item.has_data and pd_item.is_enabled and len(pd_item.values) > 0
+                float(np.max(pd_i.values))
+                for pd_i in plot_data_list
+                if pd_i.has_data and pd_i.is_enabled and len(pd_i.values) > 0
             ]
             global_max = max(all_maxes) if all_maxes else 1.0
             if global_max <= 0:
@@ -214,201 +264,141 @@ class FastMplCanvas(FigureCanvasQTAgg):
         else:
             shared_ylim = None
 
-        # First, update xlim/ylim for all axes that have data and check if any changed
-        xlim_changed = False
-        if self.background is not None:
-            for i, plot_data in enumerate(plot_data_list):
-                if i >= len(self.axes):
-                    continue
-                if plot_data.has_data and plot_data.is_enabled and len(plot_data.samples) > 0:
-                    ax = self.axes[i]
-                    current_xlim = ax.get_xlim()
-                    new_xmin, new_xmax = float(plot_data.samples[0]), float(plot_data.samples[-1])
-                    # Set the new xlim now
-                    if new_xmax > new_xmin:
-                        ax.set_xlim([new_xmin, new_xmax])
-                    # Check if limits changed significantly (more than 1% difference)
-                    if (abs(current_xlim[0] - new_xmin) > abs(new_xmin) * 0.01 or
-                            abs(current_xlim[1] - new_xmax) > abs(new_xmax) * 0.01):
-                        xlim_changed = True
-                    # Update ylim based on normalize / shared_y flags
-                    current_ylim = ax.get_ylim()
-                    if normalize:
-                        new_ylim = (-0.1, 1.1)
-                    elif shared_ylim is not None:
-                        new_ylim = shared_ylim
-                    else:
-                        data_max = float(np.max(plot_data.values)) if len(plot_data.values) > 0 else 1.0
-                        if data_max <= 0:
-                            data_max = 1.0
-                        new_ylim = (-0.05 * data_max, 1.05 * data_max)
-                    if (abs(current_ylim[0] - new_ylim[0]) > abs(new_ylim[1]) * 0.01 or
-                            abs(current_ylim[1] - new_ylim[1]) > abs(new_ylim[1]) * 0.01):
-                        ax.set_ylim(new_ylim)
-                        xlim_changed = True
-
-        # If xlim changed or no background, need full redraw to update axis labels
-        if self.background is None or xlim_changed:
-            # Clear old data before taking new background snapshot
-            for line in self.lines:
-                line.set_data([], [])
-            for scatter in self.scatters:
-                scatter.set_offsets(np.empty((0, 2)))
-            for fwhm_lc in self.fwhm_lines:
-                fwhm_lc.set_segments([])
-            for baseline_lc in self.baseline_lcs:
-                baseline_lc.set_segments([])
-            for adj_lines in self.adjusted_lines:
-                for al in adj_lines:
-                    al.set_data([], [])
-            self.init_blit()
-
-        # Restore background
-        self.restore_region(self.background)
-
-        # Update each detector
-        for i, plot_data in enumerate(plot_data_list):
-            if i >= len(self.axes):
+        for i, pd_item in enumerate(plot_data_list):
+            if i >= len(self.plots):
                 continue
 
-            ax = self.axes[i]
-            line = self.lines[i]
-            scatter = self.scatters[i]
-            text = self.text_objects[i]
-            fwhm_lc = self.fwhm_lines[i]
-            baseline_lc = self.baseline_lcs[i]
-            adj_lines = self.adjusted_lines[i]
+            p        = self.plots[i]
+            curve    = self.curves[i]
+            scatter  = self.scatter_items[i]
+            fwhm     = self.fwhm_curves[i]
+            baseline = self.baseline_curves[i]
+            adj_list = self.adj_curves[i]
 
-            # Handle different states
-            if not plot_data.has_data:
-                # No data available
-                line.set_data([], [])
-                scatter.set_offsets(np.empty((0, 2)))
-                fwhm_lc.set_segments([])
-                baseline_lc.set_segments([])
-                for al in adj_lines:
-                    al.set_data([], [])
-                text.set_text('N/A')
-                text.set_color(COLOR_GRAY)
-                text.set_visible(True)
-                ax.set_facecolor('white')
+            if not pd_item.has_data:
+                curve.setData([], [])
+                scatter.setData([], [])
+                fwhm.setData([], [])
+                baseline.setData([], [])
+                for al in adj_list:
+                    al.setData([], [])
+                self._show_overlay(i, 'N/A', COLOR_GRAY)
+                continue
 
-            elif not plot_data.is_enabled:
-                # Detector disabled
-                line.set_data([], [])
-                scatter.set_offsets(np.empty((0, 2)))
-                fwhm_lc.set_segments([])
-                baseline_lc.set_segments([])
-                for al in adj_lines:
-                    al.set_data([], [])
-                text.set_text('OFF')
-                text.set_color(COLOR_DISABLED)
-                text.set_visible(True)
-                ax.set_facecolor('#ffeeee')
+            if not pd_item.is_enabled:
+                curve.setData([], [])
+                scatter.setData([], [])
+                fwhm.setData([], [])
+                baseline.setData([], [])
+                for al in adj_list:
+                    al.setData([], [])
+                self._show_overlay(i, 'OFF', COLOR_DISABLED, '#ffeeee')
+                continue
 
+            self._hide_overlay(i)
+
+            # Trace
+            if len(pd_item.samples) > 0:
+                curve.setData(pd_item.samples, pd_item.values)
+                x_min = float(pd_item.samples[0])
+                x_max = float(pd_item.samples[-1])
+                if x_max > x_min:
+                    p.setXRange(x_min, x_max, padding=0)
+                if normalize:
+                    p.setYRange(-0.1, 1.1, padding=0)
+                elif shared_ylim is not None:
+                    p.setYRange(shared_ylim[0], shared_ylim[1], padding=0)
+                else:
+                    d_max = float(np.max(pd_item.values)) if len(pd_item.values) > 0 else 1.0
+                    if d_max <= 0:
+                        d_max = 1.0
+                    p.setYRange(-0.05 * d_max, 1.05 * d_max, padding=0)
             else:
-                # Update with data
-                text.set_visible(False)
-                ax.set_facecolor('white')
+                curve.setData([], [])
 
-                if len(plot_data.samples) > 0:
-                    line.set_data(plot_data.samples, plot_data.values)
-                    # xlim already set in the pre-check above
-                    ax.relim()  # Recalculate data limits
-                    ax.autoscale_view(scalex=False, scaley=False)  # Don't autoscale, use our limits
-                else:
-                    line.set_data([], [])
+            # Peaks
+            if pd_item.peak_positions is not None and len(pd_item.peak_positions) > 0:
+                scatter.setData(x=pd_item.peak_positions[:, 0],
+                                y=pd_item.peak_positions[:, 1])
+            else:
+                scatter.setData([], [])
 
-                # Update peaks
-                if plot_data.peak_positions is not None:
-                    scatter.set_offsets(plot_data.peak_positions)
-                else:
-                    scatter.set_offsets(np.empty((0, 2)))
+            # FWHM lines (connect='pairs')
+            if pd_item.fwhm_lines is not None and len(pd_item.fwhm_lines) > 0:
+                xs, ys = [], []
+                for pos, wl, wr, hh in pd_item.fwhm_lines:
+                    xs += [pos + wl, pos + wr]
+                    ys += [hh, hh]
+                fwhm.setData(np.asarray(xs), np.asarray(ys))
+            else:
+                fwhm.setData([], [])
 
-                # Update FWHM lines
-                if plot_data.fwhm_lines is not None and len(plot_data.fwhm_lines) > 0:
-                    # fwhm_lines is [[pos, widthL, widthR, half_height], ...]
-                    segments = []
-                    for fwhm in plot_data.fwhm_lines:
-                        pos, widthL, widthR, half_height = fwhm
-                        # Draw horizontal line from pos+widthL to pos+widthR at half_height
-                        x_start = pos + widthL
-                        x_end = pos + widthR
-                        segments.append([(x_start, half_height), (x_end, half_height)])
-                    fwhm_lc.set_segments(segments)
-                else:
-                    fwhm_lc.set_segments([])
-
-                # Update baseline / adjusted-trace artists
-                if show_baseline and plot_data.baseline_data:
-                    bl_segments = []
-                    for peak_idx, bd in enumerate(plot_data.baseline_data):
-                        # Dashed green segment connecting baseline endpoints
-                        bl_segments.append([(bd['bl_x'][0], bd['bl_y'][0]),
-                                             (bd['bl_x'][1], bd['bl_y'][1])])
-                        # Dotted adjusted trace
-                        if peak_idx < len(adj_lines):
-                            adj_lines[peak_idx].set_data(bd['adj_x'], bd['adj_y'])
-                    baseline_lc.set_segments(bl_segments)
-                    # Clear unused adjusted-trace lines
-                    n_peaks = len(plot_data.baseline_data)
-                    for k in range(n_peaks, len(adj_lines)):
-                        adj_lines[k].set_data([], [])
-                else:
-                    baseline_lc.set_segments([])
-                    for al in adj_lines:
-                        al.set_data([], [])
-
-            # Redraw this axes
-            ax.draw_artist(line)
-            ax.draw_artist(scatter)
-            ax.draw_artist(fwhm_lc)
-            ax.draw_artist(baseline_lc)
-            for al in adj_lines:
-                ax.draw_artist(al)
-            ax.draw_artist(text)
-
-        # Blit the updated region
-        self.blit(self.fig.bbox)
+            # Baseline + adjusted traces
+            if show_baseline and pd_item.baseline_data:
+                xs_bl, ys_bl = [], []
+                for k, bd in enumerate(pd_item.baseline_data):
+                    xs_bl += [bd['bl_x'][0], bd['bl_x'][1]]
+                    ys_bl += [bd['bl_y'][0], bd['bl_y'][1]]
+                    if k < len(adj_list):
+                        adj_list[k].setData(bd['adj_x'], bd['adj_y'])
+                baseline.setData(np.asarray(xs_bl), np.asarray(ys_bl))
+                for k in range(len(pd_item.baseline_data), len(adj_list)):
+                    adj_list[k].setData([], [])
+            else:
+                baseline.setData([], [])
+                for al in adj_list:
+                    al.setData([], [])
 
 
-class PolarPlotCanvas(FigureCanvasQTAgg):
-    """Polar plot canvas with blitting for fast polarization visualization"""
+# ---------------------------------------------------------------------------
+# PolarPlotCanvas
+# ---------------------------------------------------------------------------
+
+class PolarPlotCanvas(pg.PlotWidget):
+    """Polar plot rendered in Cartesian coordinates."""
 
     def __init__(self, parent=None, width=6, height=6, dpi=100):
-        self.fig = Figure(figsize=(width, height), dpi=dpi)
-        self.ax = self.fig.add_subplot(111, projection='polar')
-
-        # Configure polar plot appearance
-        self.ax.set_theta_zero_location("E")  # 0° at East (right)
-        self.ax.set_theta_direction(1)        # Counter-clockwise
-        self.ax.set_yticks([])
-        self.ax.set_title("Polarization", fontsize=12)
-
-        super().__init__(self.fig)
-
-        # Plot objects for fast updates
-        self.data_line, = self.ax.plot([], [], 'o', markersize=8, color=COLOR_DATA, label='Data')
-        self.fit_line, = self.ax.plot([], [], '-', linewidth=2, color=COLOR_FIT, label='Fit')
-        self.phi_line1, = self.ax.plot([], [], '-', linewidth=2, color=COLOR_PHI, alpha=0.7)
-        self.phi_line2, = self.ax.plot([], [], '-', linewidth=2, color=COLOR_PHI, alpha=0.7)
-
-        # Text for fit parameters
-        self.fit_text = self.ax.text(0.02, 0.98, '', transform=self.ax.transAxes,
-                                     fontsize=10, verticalalignment='top',
-                                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-
-        self.ax.legend(loc='lower right', fontsize=8)
-        self.fig.tight_layout()
-
-        # Background for blitting
+        super().__init__(parent=parent)
+        self.setViewport(QWidget())  # force software rendering (no OpenGL)
+        # Compatibility stubs
         self.background = None
-        self.last_fit_params = None
+        self.last_fit_params: Optional[dict] = None
 
-        # Snapshot reference lines
-        self.snapshots = []
+        vb = self.getPlotItem().getViewBox()
+        vb.setAspectLocked(True)
+        self.getPlotItem().hideAxis('bottom')
+        self.getPlotItem().hideAxis('left')
+        self.getPlotItem().setTitle('Polarization')
+        self.getPlotItem().hideButtons()
+        self.showGrid(x=False, y=False)
 
-        # Angles from config (degrees, will be converted to radians)
+        # Polar grid (rebuilt when r_max changes significantly)
+        self._grid_items: List[pg.PlotDataItem] = []
+        self._label_items: List[pg.TextItem] = []
+        self._r_max: float = 1.0
+        self._build_grid(1.0)
+
+        # Live data items
+        self.data_line = pg.PlotDataItem(
+            [], [],
+            pen=None,
+            symbol='o', symbolSize=8,
+            symbolPen=None, symbolBrush=_brush(COLOR_DATA))
+        self.addItem(self.data_line)
+
+        self.fit_line = pg.PlotDataItem([], [], pen=_pen(COLOR_FIT, width=2))
+        self.addItem(self.fit_line)
+
+        self.phi_line1 = pg.PlotDataItem([], [], pen=_pen(COLOR_PHI, width=2, alpha=178))
+        self.phi_line2 = pg.PlotDataItem([], [], pen=_pen(COLOR_PHI, width=2, alpha=178))
+        self.addItem(self.phi_line1)
+        self.addItem(self.phi_line2)
+
+        self.fit_text = pg.TextItem('', anchor=(0.0, 1.0), color='k')
+        self.fit_text.setPos(-self._r_max * 1.2, self._r_max * 1.2)
+        self.addItem(self.fit_text)
+
+        # Angles from config
         nxs_config = GlobalConfig.get_for_class('NXSLoader')
         self.angles_deg = np.array(
             nxs_config.get('angles', np.linspace(0, 337.5, 16).tolist())
@@ -416,356 +406,310 @@ class PolarPlotCanvas(FigureCanvasQTAgg):
         )
         self.angles_rad = np.deg2rad(self.angles_deg)
 
+        self.snapshots: List[dict] = []
+
+    # ------------------------------------------------------------------ #
+    # Polar grid                                                            #
+    # ------------------------------------------------------------------ #
+
+    def _build_grid(self, r_max: float):
+        for item in self._grid_items:
+            self.removeItem(item)
+        for item in self._label_items:
+            self.removeItem(item)
+        self._grid_items.clear()
+        self._label_items.clear()
+
+        self._r_max = r_max
+        gray = _pen('#aaaaaa', width=0.5)
+        theta = np.linspace(0, 2 * np.pi, 300)
+
+        for frac in (0.25, 0.5, 0.75, 1.0):
+            r = frac * r_max
+            item = pg.PlotDataItem(r * np.cos(theta), r * np.sin(theta), pen=gray)
+            self.addItem(item)
+            self._grid_items.append(item)
+
+        for deg in range(0, 360, 45):
+            rad = np.deg2rad(deg)
+            ray = pg.PlotDataItem(
+                [0, r_max * np.cos(rad)], [0, r_max * np.sin(rad)], pen=gray)
+            self.addItem(ray)
+            self._grid_items.append(ray)
+            lbl = pg.TextItem(f'{deg}\u00b0', anchor=(0.5, 0.5), color='#555555')
+            lbl.setPos(1.15 * r_max * np.cos(rad), 1.15 * r_max * np.sin(rad))
+            self.addItem(lbl)
+            self._label_items.append(lbl)
+
+        margin = 1.35 * r_max
+        self.setXRange(-margin, margin, padding=0)
+        self.setYRange(-margin, margin, padding=0)
+
+    # ------------------------------------------------------------------ #
+    # Public API                                                            #
+    # ------------------------------------------------------------------ #
+
     def set_angles(self, angles_deg):
-        """Update the detector-angle mapping (degrees)."""
         self.angles_deg = np.array(angles_deg)
         self.angles_rad = np.deg2rad(self.angles_deg)
 
-    def resizeEvent(self, event):
-        """Handle resize events to redraw plots properly"""
-        super().resizeEvent(event)
-        # Reset background on resize so blitting works correctly
-        self.background = None
-        self.fig.tight_layout()
-        self.draw_idle()
-        self.last_fit_params = None
-
     def init_blit(self):
-        """Initialize background for blitting (live data artists excluded from background)."""
-        # Save and clear live artists so their current data doesn't bake into the background
-        theta_d, r_d = self.data_line.get_data()
-        theta_f, r_f = self.fit_line.get_data()
-        p1, q1 = self.phi_line1.get_data()
-        p2, q2 = self.phi_line2.get_data()
-        saved_text = self.fit_text.get_text()
-        self.data_line.set_data([], [])
-        self.fit_line.set_data([], [])
-        self.phi_line1.set_data([], [])
-        self.phi_line2.set_data([], [])
-        self.fit_text.set_text('')
-        self.draw()
-        self.background = self.copy_from_bbox(self.fig.bbox)
-        # Restore live artist data (will be redrawn by _redraw_artists on next update)
-        self.data_line.set_data(theta_d, r_d)
-        self.fit_line.set_data(theta_f, r_f)
-        self.phi_line1.set_data(p1, q1)
-        self.phi_line2.set_data(p2, q2)
-        self.fit_text.set_text(saved_text)
+        pass
 
-    def take_snapshot(self, alpha=0.3, label=None):
-        """Capture the current polar data and fit as a static reference overlay."""
-        color = _SNAPSHOT_COLORS[len(self.snapshots) % len(_SNAPSHOT_COLORS)]
-        if label is None:
-            label = f"Snap {len(self.snapshots) + 1}"
-        theta_d, r_d = self.data_line.get_data()
-        theta_f, r_f = self.fit_line.get_data()
-        (snap_data,) = self.ax.plot(list(theta_d), list(r_d),
-                                    'o', markersize=5, color=color, alpha=alpha, zorder=1.5)
-        (snap_fit,) = self.ax.plot(list(theta_f), list(r_f),
-                                   '--', linewidth=1.5, color=color, alpha=alpha, zorder=1.5)
-        self.snapshots.append({'label': label, 'alpha': alpha, 'visible': True, 'color': color,
-                                'data_line': snap_data, 'fit_line': snap_fit})
-        self.background = None
-        self.last_fit_params = None
-        self.draw_idle()
+    def force_full_redraw(self):
+        pass
 
-    def set_snapshot_alpha(self, idx, alpha):
-        """Change a snapshot's alpha without removing it."""
-        if 0 <= idx < len(self.snapshots):
-            snap = self.snapshots[idx]
-            snap['alpha'] = alpha
-            snap['data_line'].set_alpha(alpha)
-            snap['fit_line'].set_alpha(alpha)
-            self.background = None
-            self.last_fit_params = None
-            self.draw_idle()
+    @staticmethod
+    def _to_cart(theta, r):
+        return r * np.cos(theta), r * np.sin(theta)
 
-    def set_snapshot_color(self, idx, color):
-        """Change a snapshot's color."""
-        if 0 <= idx < len(self.snapshots):
-            snap = self.snapshots[idx]
-            snap['color'] = color
-            snap['data_line'].set_color(color)
-            snap['fit_line'].set_color(color)
-            self.background = None
-            self.last_fit_params = None
-            self.draw_idle()
-
-    def rename_snapshot(self, idx, name):
-        """Rename a snapshot (label only, no visual change)."""
-        if 0 <= idx < len(self.snapshots):
-            self.snapshots[idx]['label'] = name
-
-    def remove_snapshot(self, idx):
-        """Remove a polar snapshot by index."""
-        if 0 <= idx < len(self.snapshots):
-            snap = self.snapshots[idx]
-            for line in (snap['data_line'], snap['fit_line']):
-                try:
-                    line.remove()
-                except ValueError:
-                    pass
-            self.snapshots.pop(idx)
-            self.background = None
-            self.last_fit_params = None
-            self.draw_idle()
-
-    def set_snapshot_visible(self, idx, visible):
-        """Toggle a polar snapshot's visibility."""
-        if 0 <= idx < len(self.snapshots):
-            snap = self.snapshots[idx]
-            snap['visible'] = visible
-            snap['data_line'].set_visible(visible)
-            snap['fit_line'].set_visible(visible)
-            self.background = None
-            self.last_fit_params = None
-            self.draw_idle()
-
-    def clear_all_snapshots(self):
-        """Remove all polar snapshots."""
-        for snap in self.snapshots:
-            for line in (snap['data_line'], snap['fit_line']):
-                try:
-                    line.remove()
-                except ValueError:
-                    pass
-        self.snapshots.clear()
-        self.background = None
-        self.last_fit_params = None
-        self.draw_idle()
-
-    def update_polar_plot(self, results_df, peak_no=0, value_type='height', beta=2.0, setPlin=None, fitBeta=False, setPhi=None, fitPhi=True):
-        """
-        Update the polar plot with new data.
-
-        Parameters:
-            results_df: DataFrame with peak results
-            peak_no: Which peak number to plot (0-indexed)
-            value_type: 'height' or 'fwhm area'
-            beta: Fixed beta value (used when fitBeta=False)
-            setPlin: Fixed Plin value (used when fitBeta=True)
-            fitBeta: If True, fit beta2 freely with Plin fixed to setPlin
-            setPhi: Fixed phi value in radians (used when fitPhi=False)
-            fitPhi: If True, phi is a free fit parameter; if False, phi is fixed to setPhi
-        """
-        visible = self.isVisible()
-
-        # Blitting operations only when the canvas is actually on screen
-        if visible:
-            if self.background is None:
-                self.init_blit()
-            self.restore_region(self.background)
-
-        # Clear previous data (artist property updates are always safe)
-        self.data_line.set_data([], [])
-        self.fit_line.set_data([], [])
-        self.phi_line1.set_data([], [])
-        self.phi_line2.set_data([], [])
-        self.fit_text.set_text('')
+    def update_polar_plot(self, results_df,
+                          peak_no=0, value_type='height', beta=2.0,
+                          setPlin=None, fitBeta=False,
+                          setPhi=None, fitPhi=True):
+        self.data_line.setData([], [])
+        self.fit_line.setData([], [])
+        self.phi_line1.setData([], [])
+        self.phi_line2.setData([], [])
+        self.fit_text.setText('')
         self.last_fit_params = None
 
         if results_df is None or results_df.empty:
-            if visible:
-                self._redraw_artists()
             return
 
-        # Filter by peak number
         peak_data = results_df[results_df['peakNo'] == peak_no]
-
         if peak_data.empty:
-            if visible:
-                self._redraw_artists()
             return
 
-        # Get values for each detector
-        # Group by detector and take mean if multiple pulses/trains
-        detector_values = peak_data.groupby('detector')[value_type].mean()
-
-        if detector_values.empty:
-            if visible:
-                self._redraw_artists()
+        det_vals = peak_data.groupby('detector')[value_type].mean()
+        if det_vals.empty:
             return
 
-        # Get angles for available detectors
-        available_detectors = detector_values.index.values
-
-        # Make sure we have valid detector indices
-        valid_mask = available_detectors < len(self.angles_rad)
-        available_detectors = available_detectors[valid_mask]
-
-        if len(available_detectors) == 0:
-            if visible:
-                self._redraw_artists()
+        avail = det_vals.index.values
+        avail = avail[avail < len(self.angles_rad)]
+        if len(avail) == 0:
             return
 
-        theta = self.angles_rad[available_detectors]
-        r_values = detector_values.loc[available_detectors].values
+        theta = self.angles_rad[avail]
+        r_vals = det_vals.loc[avail].values
 
-        # Update data points and radial limit (artist property updates, always safe)
-        self.data_line.set_data(theta, r_values)
-        r_max = np.nanmax(r_values) * 1.2 if len(r_values) > 0 else 1.0
-        self.ax.set_rlim(0, r_max)
+        r_max = float(np.nanmax(r_vals)) * 1.2 if len(r_vals) > 0 else 1.0
+        if r_max <= 0:
+            r_max = 1.0
 
-        # Fit polarization model — always run so last_fit_params stays current
+        if abs(r_max - self._r_max) > self._r_max * 0.1:
+            self._build_grid(r_max)
+            self.fit_text.setPos(-r_max * 1.2, r_max * 1.2)
+
+        xd, yd = self._to_cart(theta, r_vals)
+        self.data_line.setData(xd, yd)
+
         if len(theta) >= 3:
             try:
-                self._fit_and_plot(theta, r_values, beta, r_max, setPlin=setPlin, fitBeta=fitBeta, setPhi=setPhi, fitPhi=fitPhi)
+                self._fit_and_plot(theta, r_vals, beta, r_max,
+                                   setPlin=setPlin, fitBeta=fitBeta,
+                                   setPhi=setPhi, fitPhi=fitPhi)
             except Exception as e:
                 print(f"Fit error: {e}")
-                if visible:
-                    self.fit_text.set_text(f"Fit failed: {str(e)[:30]}")
+                self.fit_text.setText(f"Fit failed: {str(e)[:40]}")
 
-        if visible:
-            self._redraw_artists()
-
-    def _fit_and_plot(self, theta, r_values, beta, r_max, setPlin=None, fitBeta=False, setPhi=None, fitPhi=True):
-        """Fit the polarization model and update plot"""
+    def _fit_and_plot(self, theta, r_values, beta, r_max,
+                      setPlin=None, fitBeta=False, setPhi=None, fitPhi=True):
         fit_kws = dict(method='trf', ftol=1e-10, xtol=1e-10, gtol=1e-10, maxfev=5000)
-        scale_guess = np.mean(r_values)
+        scale_guess = float(np.mean(r_values))
         beta0 = beta if beta != 0 else 1.0
         phi0 = setPhi if setPhi is not None else 0.0
 
-        # Error variables — None means the parameter was fixed (not fitted)
         Plin_err = phi_err = beta2_err = scale_err = None
 
         if fitBeta:
-            # Plin is fixed
             plin_val = setPlin if setPlin is not None else 1.0
             Plin_fit = plin_val
             if fitPhi:
-                # fit phi, beta2, scale
-                def model(theta, phi, beta2, scale):
-                    return polarization_model(theta, Plin=plin_val, phi=phi, beta2=beta2, scale=scale)
-                initial_guess = [phi0, beta0, scale_guess]
-                bounds = ([-np.pi, -4.0, 0], [np.pi, 4.0, np.inf])
-                popt, pcov = curve_fit(model, theta, r_values, p0=initial_guess, bounds=bounds, **fit_kws)
+                def model(t, phi, beta2, scale):
+                    return polarization_model(t, Plin=plin_val, phi=phi,
+                                              beta2=beta2, scale=scale)
+                popt, pcov = curve_fit(model, theta, r_values,
+                                       p0=[phi0, beta0, scale_guess],
+                                       bounds=([-np.pi, -4., 0], [np.pi, 4., np.inf]),
+                                       **fit_kws)
                 phi_fit, beta2_fit, scale_fit = popt
                 phi_err, beta2_err, scale_err = np.sqrt(np.diag(pcov))
             else:
-                # phi fixed; fit beta2, scale
-                phi_fixed = setPhi if setPhi is not None else 0.0
-                phi_fit = phi_fixed
-                def model(theta, beta2, scale):
-                    return polarization_model(theta, Plin=plin_val, phi=phi_fixed, beta2=beta2, scale=scale)
-                initial_guess = [beta0, scale_guess]
-                bounds = ([-4.0, 0], [4.0, np.inf])
-                popt, pcov = curve_fit(model, theta, r_values, p0=initial_guess, bounds=bounds, **fit_kws)
+                phi_fit = setPhi if setPhi is not None else 0.0
+                def model(t, beta2, scale):
+                    return polarization_model(t, Plin=plin_val, phi=phi_fit,
+                                              beta2=beta2, scale=scale)
+                popt, pcov = curve_fit(model, theta, r_values,
+                                       p0=[beta0, scale_guess],
+                                       bounds=([-4., 0], [4., np.inf]),
+                                       **fit_kws)
                 beta2_fit, scale_fit = popt
                 beta2_err, scale_err = np.sqrt(np.diag(pcov))
         else:
-            # beta fixed
             beta2_fit = beta
             if fitPhi:
-                # Fully free (Plin and phi both fitted): use A/B parameterisation
-                # A = Plin·cos(2φ), B = Plin·sin(2φ) — linear, more numerically stable
-                def model(theta, A, B, scale):
-                    return sepModel(theta, A, B, beta2=beta, scale=scale)
-                initial_guess = [0.0, 0.0, scale_guess]
-                bounds = ([-2.0, -2.0, 0], [2.0, 2.0, np.inf])
-                popt, pcov = curve_fit(model, theta, r_values, p0=initial_guess, bounds=bounds, **fit_kws)
+                def model(t, A, B, scale):
+                    return sepModel(t, A, B, beta2=beta, scale=scale)
+                popt, pcov = curve_fit(model, theta, r_values,
+                                       p0=[0., 0., scale_guess],
+                                       bounds=([-2., -2., 0], [2., 2., np.inf]),
+                                       **fit_kws)
                 A_fit, B_fit, scale_fit = popt
-                scale_err = np.sqrt(pcov[2, 2])
+                scale_err = float(np.sqrt(pcov[2, 2]))
                 cov_AB = pcov[:2, :2]
-
-                Plin_fit = np.sqrt(A_fit**2 + B_fit**2)
-                phi_fit = 0.5 * np.arctan2(B_fit, A_fit)
-
-                # Error propagation from cov(A, B) → σ_Plin and σ_φ
-                sigma_A2, sigma_B2, sigma_AB = cov_AB[0, 0], cov_AB[1, 1], cov_AB[0, 1]
+                Plin_fit = float(np.sqrt(A_fit**2 + B_fit**2))
+                phi_fit  = float(0.5 * np.arctan2(B_fit, A_fit))
+                sA2, sB2, sAB = cov_AB[0, 0], cov_AB[1, 1], cov_AB[0, 1]
                 if Plin_fit > 1e-10:
-                    Plin_err = np.sqrt(
-                        (A_fit / Plin_fit)**2 * sigma_A2 +
-                        (B_fit / Plin_fit)**2 * sigma_B2 +
-                        2 * (A_fit * B_fit / Plin_fit**2) * sigma_AB
-                    )
-                    phi_err = 0.5 * np.sqrt(
-                        (B_fit**2 * sigma_A2 + A_fit**2 * sigma_B2 - 2 * A_fit * B_fit * sigma_AB)
-                        / (A_fit**2 + B_fit**2)**2
-                    )
+                    Plin_err = float(np.sqrt(
+                        (A_fit / Plin_fit)**2 * sA2 +
+                        (B_fit / Plin_fit)**2 * sB2 +
+                        2 * (A_fit * B_fit / Plin_fit**2) * sAB))
+                    phi_err = float(0.5 * np.sqrt(
+                        (B_fit**2 * sA2 + A_fit**2 * sB2 -
+                         2 * A_fit * B_fit * sAB)
+                        / (A_fit**2 + B_fit**2)**2))
                 else:
-                    Plin_err = 0.0
-                    phi_err = 0.0
+                    Plin_err = phi_err = 0.0
             else:
-                # phi fixed; fit Plin, scale
-                phi_fixed = setPhi if setPhi is not None else 0.0
-                phi_fit = phi_fixed
-                def model(theta, Plin, scale):
-                    return polarization_model(theta, Plin=Plin, phi=phi_fixed, beta2=beta, scale=scale)
-                initial_guess = [0.2, scale_guess]
-                bounds = ([0.0, 0], [2.0, np.inf])
-                popt, pcov = curve_fit(model, theta, r_values, p0=initial_guess, bounds=bounds, **fit_kws)
+                phi_fit = setPhi if setPhi is not None else 0.0
+                def model(t, Plin, scale):
+                    return polarization_model(t, Plin=Plin, phi=phi_fit,
+                                              beta2=beta, scale=scale)
+                popt, pcov = curve_fit(model, theta, r_values,
+                                       p0=[0.2, scale_guess],
+                                       bounds=([0., 0], [2., np.inf]),
+                                       **fit_kws)
                 Plin_fit, scale_fit = popt
                 Plin_err, scale_err = np.sqrt(np.diag(pcov))
 
         self.last_fit_params = {
-            'Plin': Plin_fit,
-            'phi': phi_fit,
-            'scale': scale_fit,
-            'beta': beta2_fit,
-            'pcov': pcov
+            'Plin': Plin_fit, 'phi': phi_fit,
+            'scale': scale_fit, 'beta': beta2_fit, 'pcov': pcov,
         }
 
-        # Generate smooth fit curve
-        theta_fit = np.linspace(0, 2 * np.pi, 360)
-        r_fit = polarization_model(theta_fit, Plin=Plin_fit, phi=phi_fit, beta2=beta2_fit, scale=scale_fit)
+        tf = np.linspace(0, 2 * np.pi, 360)
+        rf = polarization_model(tf, Plin=Plin_fit, phi=phi_fit,
+                                beta2=beta2_fit, scale=scale_fit)
+        xf, yf = self._to_cart(tf, rf)
+        self.fit_line.setData(xf, yf)
 
-        # Update fit line
-        self.fit_line.set_data(theta_fit, r_fit)
-
-        # Update phi indicator lines if polarization is significant
         if Plin_fit > 0.015:
-            self.phi_line1.set_data([phi_fit, phi_fit], [0, r_max])
-            self.phi_line2.set_data([phi_fit + np.pi, phi_fit + np.pi], [0, r_max])
+            for line_item, angle in ((self.phi_line1, phi_fit),
+                                     (self.phi_line2, phi_fit + np.pi)):
+                x, y = self._to_cart(np.array([angle, angle]),
+                                     np.array([0.0, r_max]))
+                line_item.setData(x, y)
         else:
-            self.phi_line1.set_data([], [])
-            self.phi_line2.set_data([], [])
+            self.phi_line1.setData([], [])
+            self.phi_line2.setData([], [])
 
-        # Build fit info text — show ± uncertainty for fitted parameters, (fixed) otherwise
         phi_deg = np.rad2deg(phi_fit) % 360
-        plin_str = (f"Plin: {Plin_fit:.4f} ± {Plin_err:.4f}" if Plin_err is not None
+        plin_str = (f"Plin: {Plin_fit:.4f} \u00b1 {Plin_err:.4f}"
+                    if Plin_err is not None
                     else f"Plin: {Plin_fit:.4f} (fixed)")
-        phi_str = (f"φ: {phi_deg:.1f}° ± {np.rad2deg(phi_err):.1f}°" if phi_err is not None
-                   else f"φ: {phi_deg:.1f}° (fixed)")
-        beta_str = (f"β: {beta2_fit:.4f} ± {beta2_err:.4f}" if beta2_err is not None
-                    else f"β: {beta2_fit:.3f} (fixed)")
-        scale_str = (f"Scale: {scale_fit:.4f} ± {scale_err:.4f}" if scale_err is not None
+        phi_str = (f"\u03c6: {phi_deg:.1f}\u00b0 \u00b1 {np.rad2deg(phi_err):.1f}\u00b0"
+                   if phi_err is not None
+                   else f"\u03c6: {phi_deg:.1f}\u00b0 (fixed)")
+        beta_str = (f"\u03b2: {beta2_fit:.4f} \u00b1 {beta2_err:.4f}"
+                    if beta2_err is not None
+                    else f"\u03b2: {beta2_fit:.3f} (fixed)")
+        scale_str = (f"Scale: {scale_fit:.4f} \u00b1 {scale_err:.4f}"
+                     if scale_err is not None
                      else f"Scale: {scale_fit:.4f}")
-        fit_info = f"{plin_str}\n{phi_str}\n{beta_str}\n{scale_str}"
-        self.fit_text.set_text(fit_info)
+        self.fit_text.setText(f"{plin_str}\n{phi_str}\n{beta_str}\n{scale_str}")
 
-    def _redraw_artists(self):
-        """Redraw all artists and blit"""
-        self.ax.draw_artist(self.data_line)
-        self.ax.draw_artist(self.fit_line)
-        self.ax.draw_artist(self.phi_line1)
-        self.ax.draw_artist(self.phi_line2)
-        self.ax.draw_artist(self.fit_text)
-        self.blit(self.fig.bbox)
+    # ------------------------------------------------------------------ #
+    # Snapshot API                                                          #
+    # ------------------------------------------------------------------ #
 
-    def force_full_redraw(self):
-        """Force a full redraw (needed when r-limits change significantly)"""
-        self.draw()
-        self.background = self.copy_from_bbox(self.fig.bbox)
+    def take_snapshot(self, alpha: float = 0.3, label=None):
+        color = _SNAPSHOT_COLORS[len(self.snapshots) % len(_SNAPSHOT_COLORS)]
+        if label is None:
+            label = f"Snap {len(self.snapshots) + 1}"
+        a_int = int(alpha * 255)
+
+        xd, yd = self.data_line.getData()
+        snap_data = pg.PlotDataItem(
+            [] if xd is None else list(xd),
+            [] if yd is None else list(yd),
+            pen=None,
+            symbol='o', symbolSize=5,
+            symbolPen=None,
+            symbolBrush=_brush(color, alpha=a_int))
+        self.addItem(snap_data)
+
+        xf, yf = self.fit_line.getData()
+        snap_fit = pg.PlotDataItem(
+            [] if xf is None else list(xf),
+            [] if yf is None else list(yf),
+            pen=_pen(color, width=1.5, style=Qt.PenStyle.DashLine, alpha=a_int))
+        self.addItem(snap_fit)
+
+        self.snapshots.append({
+            'label': label, 'alpha': alpha, 'visible': True, 'color': color,
+            'data_item': snap_data, 'fit_item': snap_fit,
+        })
+
+    def _update_snap_style(self, snap: dict):
+        a = int(snap['alpha'] * 255)
+        c = snap['color']
+        snap['data_item'].setSymbolBrush(_brush(c, alpha=a))
+        snap['fit_item'].setPen(_pen(c, width=1.5, style=Qt.PenStyle.DashLine, alpha=a))
+
+    def set_snapshot_alpha(self, idx: int, alpha: float):
+        if 0 <= idx < len(self.snapshots):
+            self.snapshots[idx]['alpha'] = alpha
+            self._update_snap_style(self.snapshots[idx])
+
+    def set_snapshot_color(self, idx: int, color: str):
+        if 0 <= idx < len(self.snapshots):
+            self.snapshots[idx]['color'] = color
+            self._update_snap_style(self.snapshots[idx])
+
+    def rename_snapshot(self, idx: int, name: str):
+        if 0 <= idx < len(self.snapshots):
+            self.snapshots[idx]['label'] = name
+
+    def remove_snapshot(self, idx: int):
+        if 0 <= idx < len(self.snapshots):
+            snap = self.snapshots.pop(idx)
+            self.removeItem(snap['data_item'])
+            self.removeItem(snap['fit_item'])
+
+    def set_snapshot_visible(self, idx: int, visible: bool):
+        if 0 <= idx < len(self.snapshots):
+            snap = self.snapshots[idx]
+            snap['visible'] = visible
+            snap['data_item'].setVisible(visible)
+            snap['fit_item'].setVisible(visible)
+
+    def clear_all_snapshots(self):
+        for snap in self.snapshots:
+            self.removeItem(snap['data_item'])
+            self.removeItem(snap['fit_item'])
+        self.snapshots.clear()
 
 
-class AngularHeatmapCanvas(FigureCanvasQTAgg):
-    """Polar pcolormesh canvas showing intensity vs detector angle and sample position.
+# ---------------------------------------------------------------------------
+# AngularHeatmapCanvas
+# ---------------------------------------------------------------------------
 
-    Uses the same interpolation logic as ``Plotter._buildIntensityGrid``.
-    Redraws fully each update (no blitting) — only active when its tab is shown.
-    """
+class AngularHeatmapCanvas(pg.GraphicsLayoutWidget):
+    """Polar heatmap using PColorMeshItem (intensity vs angle vs sample pos)."""
 
     def __init__(self, parent=None, width=7, height=7, dpi=100):
-        self.fig = Figure(figsize=(width, height), dpi=dpi)
-        # Polar axes + narrow colorbar axes with fixed width ratio
-        self.ax = self.fig.add_axes([0.05, 0.05, 0.78, 0.88], projection='polar')
-        self.cax = self.fig.add_axes([0.87, 0.15, 0.03, 0.65])  # fixed colorbar slot
-        self.ax.set_theta_zero_location('E')
-        self.ax.set_theta_direction(1)
-        self.ax.set_title('Angular Heatmap', fontsize=12)
-        super().__init__(self.fig)
+        super().__init__(parent=parent)
+        self.setViewport(QWidget())  # force software rendering (no OpenGL)
 
-        # Detector-angle mapping from config (same source as PolarPlotCanvas)
+        self.plot = self.addPlot(row=0, col=0)
+        self.plot.getViewBox().setAspectLocked(True)
+        self.plot.hideAxis('bottom')
+        self.plot.hideAxis('left')
+        self.plot.setTitle('Angular Heatmap')
+        self.plot.hideButtons()
+
         nxs_config = GlobalConfig.get_for_class('NXSLoader')
         self.angles_deg = np.array(
             nxs_config.get('angles', np.linspace(0, 337.5, 16).tolist())
@@ -773,86 +717,77 @@ class AngularHeatmapCanvas(FigureCanvasQTAgg):
         )
         self.angles_rad = np.deg2rad(self.angles_deg)
 
-        self._colorbar = None
-        self._cbar_mappable = None
+        self._mesh_item: Optional[pg.PColorMeshItem] = None
+        self._peak_items: List[pg.GraphicsObject] = []
+        self._grid_items: List[pg.PlotDataItem] = []
+        self._grid_labels: List[pg.TextItem] = []
 
     def set_angles(self, angles_deg):
-        """Update the detector-angle mapping (degrees)."""
         self.angles_deg = np.array(angles_deg)
         self.angles_rad = np.deg2rad(self.angles_deg)
-        self._cbar_mappable = None
-
-    # ------------------------------------------------------------------
-    # Internal helpers (mirrors Plotter._buildIntensityGrid)
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _build_intensity_grid(traces, angles_rad, n_theta=720):
-        """Interpolate *traces* (n_det × n_sample) onto a uniform theta grid.
-
-        Returns
-        -------
-        grid : ndarray, shape (n_theta, n_sample)
-        theta_grid : ndarray, shape (n_theta,)
-        """
         n_samples = traces.shape[1]
         theta_grid = np.linspace(0, 2 * np.pi, n_theta, endpoint=False)
         grid = np.zeros((n_theta, n_samples))
-
         sort_idx = np.argsort(angles_rad)
         sorted_angles = angles_rad[sort_idx]
         sorted_traces = traces[sort_idx]
-
         for si in range(n_samples):
             vals = sorted_traces[:, si]
-            xp_ext = np.concatenate(
-                [sorted_angles - 2 * np.pi, sorted_angles, sorted_angles + 2 * np.pi]
-            )
+            xp_ext = np.concatenate([sorted_angles - 2 * np.pi,
+                                      sorted_angles,
+                                      sorted_angles + 2 * np.pi])
             fp_ext = np.concatenate([vals, vals, vals])
             grid[:, si] = np.interp(theta_grid, xp_ext, fp_ext)
-
         return grid, theta_grid
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    def _rebuild_polar_grid(self, r_min: float, r_max: float):
+        for item in self._grid_items + self._grid_labels:
+            self.plot.removeItem(item)
+        self._grid_items.clear()
+        self._grid_labels.clear()
 
-    def update_heatmap(
-        self,
-        plot_data_list: List['PlotData'],
-        results_df,
-        sample_min: int,
-        sample_max: int,
-        interpolate: bool = True,
-        show_peaks: bool = True,
-    ):
-        """Rebuild the heatmap from current plot data and results.
+        gray = _pen('#bbbbbb', width=0.5)
+        theta = np.linspace(0, 2 * np.pi, 300)
+        for r in (r_min, (r_min + r_max) / 2, r_max):
+            item = pg.PlotDataItem(r * np.cos(theta), r * np.sin(theta), pen=gray)
+            self.plot.addItem(item)
+            self._grid_items.append(item)
 
-        Parameters
-        ----------
-        plot_data_list : list of PlotData
-            Plot-ready detector data (downsampled traces).
-        results_df : pandas.DataFrame or None
-            Peak-finding results (may be None / empty).
-        sample_min, sample_max : int
-            Displayed radial range (sample coordinates).
-        interpolate : bool
-            If True, smooth 720-point theta interpolation; else discrete wedges.
-        show_peaks : bool
-            Overlay peak scatter + width lines when True.
-        """
-        # Clear only the polar axes — cax (colorbar slot) keeps its position
-        self.ax.cla()
-        self.cax.cla()
-        self.ax.set_theta_zero_location('E')
-        self.ax.set_theta_direction(1)
-        self.ax.set_title('Angular Heatmap', fontsize=12)
+        for deg in range(0, 360, 45):
+            rad = np.deg2rad(deg)
+            ray = pg.PlotDataItem(
+                [r_min * np.cos(rad), r_max * np.cos(rad)],
+                [r_min * np.sin(rad), r_max * np.sin(rad)],
+                pen=gray)
+            self.plot.addItem(ray)
+            self._grid_items.append(ray)
+            lbl = pg.TextItem(f'{deg}\u00b0', anchor=(0.5, 0.5), color='#555555')
+            lbl.setPos(1.12 * r_max * np.cos(rad), 1.12 * r_max * np.sin(rad))
+            self.plot.addItem(lbl)
+            self._grid_labels.append(lbl)
 
-        # Collect enabled detectors that have data
-        det_ids = []
-        traces_list = []
-        sample_coords = None
+        margin = 1.25 * r_max
+        self.plot.setXRange(-margin, margin, padding=0)
+        self.plot.setYRange(-margin, margin, padding=0)
 
+    def update_heatmap(self, plot_data_list: List['PlotData'],
+                       results_df,
+                       sample_min: int, sample_max: int,
+                       interpolate: bool = True,
+                       show_peaks: bool = True):
+        # Remove previous dynamic items
+        if self._mesh_item is not None:
+            self.plot.removeItem(self._mesh_item)
+            self._mesh_item = None
+        for item in self._peak_items:
+            self.plot.removeItem(item)
+        self._peak_items.clear()
+
+        # Collect enabled detectors
+        det_ids, traces_list, sample_coords = [], [], None
         for pd_obj in plot_data_list:
             if not pd_obj.has_data or not pd_obj.is_enabled:
                 continue
@@ -861,441 +796,394 @@ class AngularHeatmapCanvas(FigureCanvasQTAgg):
             det_id = pd_obj.detector_id
             if det_id >= len(self.angles_deg):
                 continue
-
-            # Filter by sample range
-            smin_idx = int(np.searchsorted(pd_obj.samples, sample_min))
-            smax_idx = int(np.searchsorted(pd_obj.samples, sample_max, side='right'))
-            smin_idx = max(0, smin_idx)
-            smax_idx = min(len(pd_obj.samples), smax_idx)
-            if smax_idx <= smin_idx:
+            si = int(np.searchsorted(pd_obj.samples, sample_min))
+            ei = int(np.searchsorted(pd_obj.samples, sample_max, side='right'))
+            si, ei = max(0, si), min(len(pd_obj.samples), ei)
+            if ei <= si:
                 continue
-
-            trace_slice = pd_obj.values[smin_idx:smax_idx]
-            s_slice = pd_obj.samples[smin_idx:smax_idx]
-
             det_ids.append(det_id)
-            traces_list.append(trace_slice)
+            traces_list.append(pd_obj.values[si:ei])
+            s_slice = pd_obj.samples[si:ei]
             if sample_coords is None or len(s_slice) > len(sample_coords):
                 sample_coords = s_slice
 
         if not det_ids or sample_coords is None or len(sample_coords) == 0:
-            self.cax.set_visible(False)
-            self.draw_idle()
             return
-        self.cax.set_visible(True)
 
-        # Align all traces to the common sample_coords length
         n_samples = len(sample_coords)
         traces = np.zeros((len(det_ids), n_samples))
-        for idx, t in enumerate(traces_list):
+        for k, t in enumerate(traces_list):
             n = min(len(t), n_samples)
-            traces[idx, :n] = t[:n]
+            traces[k, :n] = t[:n]
 
         angles_rad = self.angles_rad[det_ids]
+        dr = float(sample_coords[1] - sample_coords[0]) if n_samples > 1 else 1.0
+        r_edges = np.concatenate([[sample_coords[0] - dr / 2],
+                                   sample_coords + dr / 2])
 
-        # Radius bin edges
-        if n_samples > 1:
-            dr = sample_coords[1] - sample_coords[0]
-        else:
-            dr = 1.0
-        r_edges = np.concatenate([[sample_coords[0] - dr / 2], sample_coords + dr / 2])
-
-        vmin = traces.min()
-        vmax = traces.max() if traces.max() > vmin else vmin + 1e-9
+        vmin = float(traces.min())
+        vmax = float(traces.max()) if traces.max() > vmin else vmin + 1e-9
+        cmap = pg.colormap.get('viridis')
 
         if interpolate:
             grid, theta_grid = self._build_intensity_grid(traces, angles_rad, n_theta=720)
             d_theta = theta_grid[1] - theta_grid[0]
-            theta_edges = np.append(theta_grid - d_theta / 2, theta_grid[-1] + d_theta / 2)
-            mesh = self.ax.pcolormesh(
-                theta_edges, r_edges, grid.T,
-                cmap='viridis', vmin=vmin, vmax=vmax, shading='auto',
-            )
+            theta_edges = np.append(theta_grid - d_theta / 2,
+                                    theta_grid[-1] + d_theta / 2)   # (721,)
+            th_m, r_m = np.meshgrid(theta_edges, r_edges, indexing='ij')  # (721, ns+1)
+            x_mesh = r_m * np.cos(th_m)
+            y_mesh = r_m * np.sin(th_m)
+            mesh = pg.PColorMeshItem(x_mesh, y_mesh, grid,
+                                     colorMap=cmap, levels=(vmin, vmax))
+            self.plot.addItem(mesh)
+            self._mesh_item = mesh
         else:
-            # Compute per-detector wedge half-widths as half the gap to each neighbour
-            n_dets = len(angles_rad)
+            n_dets = len(det_ids)
             if n_dets > 1:
-                sorted_idx = np.argsort(angles_rad)
-                sorted_ang = angles_rad[sorted_idx]
-                gaps = np.diff(sorted_ang, append=sorted_ang[0] + 2 * np.pi)
-                left_half = np.roll(gaps, 1) / 2
+                s_idx = np.argsort(angles_rad)
+                s_ang = angles_rad[s_idx]
+                gaps = np.diff(s_ang, append=s_ang[0] + 2 * np.pi)
+                left_half  = np.roll(gaps, 1) / 2
                 right_half = gaps / 2
-                inv_idx = np.argsort(sorted_idx)
-                wedge_left = left_half[inv_idx]
-                wedge_right = right_half[inv_idx]
+                inv_idx = np.argsort(s_idx)
+                wl = left_half[inv_idx]
+                wr = right_half[inv_idx]
             else:
-                wedge_left = np.array([np.pi])
-                wedge_right = np.array([np.pi])
-            for idx in range(len(det_ids)):
-                ang = angles_rad[idx]
-                theta_edges = np.array([ang - wedge_left[idx], ang + wedge_right[idx]])
-                C = traces[idx, :][np.newaxis, :]
-                self.ax.pcolormesh(
-                    theta_edges, r_edges, C.T,
-                    cmap='viridis', vmin=vmin, vmax=vmax, shading='auto',
-                )
-            mesh = self.ax.pcolormesh(
-                [0, 0.01], [r_edges[0], r_edges[-1]], [[vmin]],
-                cmap='viridis', vmin=vmin, vmax=vmax, shading='auto',
-            )
-            mesh.set_visible(False)
+                wl = wr = np.array([np.pi])
 
-        # Colourbar — drawn into the fixed cax slot, never touches self.ax geometry
-        self._colorbar = self.fig.colorbar(mesh, cax=self.cax, label='Intensity')
+            for k in range(n_dets):
+                ang = angles_rad[k]
+                th_e = np.array([ang - wl[k], ang + wr[k]])
+                th_m, r_m = np.meshgrid(th_e, r_edges, indexing='ij')
+                x_w = r_m * np.cos(th_m)
+                y_w = r_m * np.sin(th_m)
+                z_w = traces[k, :][np.newaxis, :]
+                item = pg.PColorMeshItem(x_w, y_w, z_w,
+                                         colorMap=cmap, levels=(vmin, vmax))
+                self.plot.addItem(item)
+                self._peak_items.append(item)
 
-        self.ax.set_rlim(r_edges[0], r_edges[-1])
-        self.ax.spines['polar'].set_visible(False)
+        # Rebuild polar grid
+        self._rebuild_polar_grid(float(sample_coords[0]), float(sample_coords[-1]))
 
         # Peak overlay
         if show_peaks and results_df is not None and not results_df.empty:
-            for _, peak_row in results_df.iterrows():
-                det = int(peak_row['detector'])
+            px_list, py_list = [], []
+            for _, row in results_df.iterrows():
+                det = int(row['detector'])
                 if det >= len(self.angles_rad):
                     continue
                 ang = self.angles_rad[det]
-                pos = peak_row['pos']
-                wl = peak_row['width left']
-                wr = peak_row['width right']
-                self.ax.scatter([ang], [pos], color='red', s=20, zorder=6)
-                self.ax.plot([ang, ang], [pos + wl, pos + wr],
-                             color='red', linewidth=0.8, zorder=6)
+                pos = row['pos']
+                wl_p = row['width left']
+                wr_p = row['width right']
+                px_list.append(pos * np.cos(ang))
+                py_list.append(pos * np.sin(ang))
+                wline = pg.PlotDataItem(
+                    [(pos + wl_p) * np.cos(ang), (pos + wr_p) * np.cos(ang)],
+                    [(pos + wl_p) * np.sin(ang), (pos + wr_p) * np.sin(ang)],
+                    pen=_pen('#ff0000', width=0.8))
+                self.plot.addItem(wline)
+                self._peak_items.append(wline)
+            if px_list:
+                sc = pg.ScatterPlotItem(x=px_list, y=py_list,
+                                        size=6, pen=None, brush=_brush('#ff0000'))
+                self.plot.addItem(sc)
+                self._peak_items.append(sc)
 
-        self.draw_idle()
 
+# ---------------------------------------------------------------------------
+# SingleDetectorCanvas
+# ---------------------------------------------------------------------------
 
-class SingleDetectorCanvas(FigureCanvasQTAgg):
-    """Matplotlib canvas for a single detector with interactive zoom/pan via toolbar"""
+class SingleDetectorCanvas(pg.PlotWidget):
+    """Single-detector zoom/pan canvas replacing the original matplotlib one."""
 
     def __init__(self, parent=None, width=8, height=4, dpi=100):
-        self.fig = Figure(figsize=(width, height), dpi=dpi)
-        self.ax = self.fig.add_subplot(111)
-        self.ax.grid(True, alpha=0.3)
-        self.ax.set_title('Detector 0', fontsize=10)
-        self.ax.tick_params(labelsize=8)
-        self.ax.set_ylim([-0.1, 1.1])
-        self.ax.set_xlim([0, 1000])
-        self.ax.ticklabel_format(style='plain', axis='x', useOffset=False)
-        self.ax.xaxis.get_major_formatter().set_scientific(False)
-        self.fig.tight_layout(pad=1.5)
-        super().__init__(self.fig)
+        super().__init__(parent=parent)
+        self.setViewport(QWidget())  # force software rendering (no OpenGL)
         self.setMaximumHeight(520)
 
-        self.line, = self.ax.plot([], [], color=COLOR_TRACE, linewidth=0.8, alpha=0.9)
-        self.scatter = self.ax.scatter([], [], color=COLOR_PEAK, s=40, zorder=5)
+        p = self.getPlotItem()
+        p.showGrid(x=True, y=True, alpha=0.3)
+        p.setTitle('Detector 0')
+        p.setYRange(-0.1, 1.1, padding=0)
+        p.setXRange(0, 1000, padding=0)
+        p.hideButtons()
 
-        self.fwhm_lc = LineCollection([], colors=COLOR_FWHM, linewidths=1.5, zorder=4)
-        self.ax.add_collection(self.fwhm_lc)
+        self.line = p.plot([], [], pen=_pen(COLOR_TRACE, width=0.8))
+        self.scatter = pg.ScatterPlotItem(size=8, pen=None, brush=_brush(COLOR_PEAK))
+        p.addItem(self.scatter)
 
-        self.baseline_lc = LineCollection([], colors=_COLOR_BASELINE, linewidths=1.2,
-                                          linestyles='dashed', zorder=3)
-        self.ax.add_collection(self.baseline_lc)
+        self.fwhm_lc = pg.PlotDataItem([], [], pen=_pen(COLOR_FWHM, width=1.5),
+                                        connect='pairs')
+        p.addItem(self.fwhm_lc)
 
-        self.adj_lines = []
+        self.baseline_lc = pg.PlotDataItem(
+            [], [],
+            pen=_pen(_COLOR_BASELINE, width=1.2, style=Qt.PenStyle.DashLine),
+            connect='pairs')
+        p.addItem(self.baseline_lc)
+
+        self.adj_lines: List[pg.PlotDataItem] = []
         for _ in range(_MAX_BASELINE_PEAKS):
-            adj_line, = self.ax.plot([], [], color=_COLOR_ADJUSTED, linestyle='dotted',
-                                     linewidth=1.0, alpha=0.7, zorder=3)
-            self.adj_lines.append(adj_line)
+            al = p.plot([], [],
+                        pen=_pen(_COLOR_ADJUSTED, width=1.0,
+                                 style=Qt.PenStyle.DotLine, alpha=178))
+            self.adj_lines.append(al)
 
-        self.text_obj = self.ax.text(0.5, 0.5, '', ha='center', va='center',
-                                     transform=self.ax.transAxes, fontsize=12, color=COLOR_GRAY)
-        self.text_obj.set_visible(False)
+        self.text_obj = pg.TextItem('', color=COLOR_GRAY, anchor=(0.5, 0.5))
+        self.text_obj.setVisible(False)
+        p.addItem(self.text_obj)
 
-        # _user_navigated: set to True when user zooms/pans so we stop overriding limits
         self._user_navigated = False
+        self.getPlotItem().getViewBox().sigRangeChangedManually.connect(
+            self._on_user_navigate)
 
-        # Snapshot reference lines — list of dicts:
-        #   {'label': str, 'alpha': float, 'visible': bool,
-        #    'line': Line2D, 'plot_data_list': List[PlotData]}
-        self.snapshots = []
+        self.snapshots: List[dict] = []
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self.fig.tight_layout(pad=1.5)
-        self.draw_idle()
+    def _on_user_navigate(self, *args):
+        self._user_navigated = True
 
-    def take_snapshot(self, plot_data_list, alpha=0.3, label=None, current_det_idx=0):
-        """Capture plot data as a static reference line for the active detector."""
+    def _show_overlay(self, msg: str, color: str, bg: str = 'white'):
+        self.setXRange(0, 1000, padding=0)
+        self.setYRange(-0.1, 1.1, padding=0)
+        self.text_obj.setPos(500.0, 0.5)
+        self.text_obj.setText(msg)
+        self.text_obj.setColor(QColor(color))
+        self.text_obj.setVisible(True)
+        self.getPlotItem().getViewBox().setBackgroundColor(QColor(bg))
+
+    def _hide_overlay(self):
+        self.text_obj.setVisible(False)
+        self.getPlotItem().getViewBox().setBackgroundColor(QColor('white'))
+
+    # ------------------------------------------------------------------ #
+    # Snapshot API                                                          #
+    # ------------------------------------------------------------------ #
+
+    def take_snapshot(self, plot_data_list, alpha: float = 0.3,
+                      label=None, current_det_idx: int = 0):
         color = _SNAPSHOT_COLORS[len(self.snapshots) % len(_SNAPSHOT_COLORS)]
         if label is None:
             label = f"Snap {len(self.snapshots) + 1}"
-        (line,) = self.ax.plot([], [], color=color, linewidth=0.8, alpha=alpha, zorder=1.5)
+        line = self.getPlotItem().plot([], [], pen=_snap_pen(color, alpha))
         if current_det_idx < len(plot_data_list):
-            pd_snap = plot_data_list[current_det_idx]
-            if pd_snap.has_data and pd_snap.is_enabled and len(pd_snap.samples) > 0:
-                line.set_data(pd_snap.samples, pd_snap.values)
+            pd_s = plot_data_list[current_det_idx]
+            if pd_s.has_data and pd_s.is_enabled and len(pd_s.samples) > 0:
+                line.setData(pd_s.samples, pd_s.values)
         self.snapshots.append({
             'label': label, 'alpha': alpha, 'visible': True, 'color': color,
-            'line': line, 'plot_data_list': list(plot_data_list)
+            'line': line, 'plot_data_list': list(plot_data_list),
         })
-        self.draw_idle()
 
-    def set_snapshot_alpha(self, idx, alpha):
-        """Change a snapshot's alpha without removing it."""
+    def set_snapshot_alpha(self, idx: int, alpha: float):
         if 0 <= idx < len(self.snapshots):
-            self.snapshots[idx]['alpha'] = alpha
-            self.snapshots[idx]['line'].set_alpha(alpha)
-            self.draw_idle()
+            snap = self.snapshots[idx]
+            snap['alpha'] = alpha
+            snap['line'].setPen(_snap_pen(snap['color'], alpha))
 
-    def set_snapshot_color(self, idx, color):
-        """Change a snapshot's color."""
+    def set_snapshot_color(self, idx: int, color: str):
         if 0 <= idx < len(self.snapshots):
-            self.snapshots[idx]['color'] = color
-            self.snapshots[idx]['line'].set_color(color)
-            self.draw_idle()
+            snap = self.snapshots[idx]
+            snap['color'] = color
+            snap['line'].setPen(_snap_pen(color, snap['alpha']))
 
-    def rename_snapshot(self, idx, name):
-        """Rename a snapshot (label only, no visual change)."""
+    def rename_snapshot(self, idx: int, name: str):
         if 0 <= idx < len(self.snapshots):
             self.snapshots[idx]['label'] = name
 
-    def remove_snapshot(self, idx):
-        """Remove a snapshot by index."""
+    def remove_snapshot(self, idx: int):
         if 0 <= idx < len(self.snapshots):
-            try:
-                self.snapshots[idx]['line'].remove()
-            except ValueError:
-                pass
-            self.snapshots.pop(idx)
-            self.draw_idle()
+            snap = self.snapshots.pop(idx)
+            self.getPlotItem().removeItem(snap['line'])
 
-    def set_snapshot_visible(self, idx, visible):
-        """Toggle a snapshot's visibility."""
+    def set_snapshot_visible(self, idx: int, visible: bool):
         if 0 <= idx < len(self.snapshots):
             self.snapshots[idx]['visible'] = visible
-            self.snapshots[idx]['line'].set_visible(visible)
-            self.draw_idle()
+            self.snapshots[idx]['line'].setVisible(visible)
 
     def clear_all_snapshots(self):
-        """Remove all snapshots."""
         for snap in self.snapshots:
-            try:
-                snap['line'].remove()
-            except ValueError:
-                pass
+            self.getPlotItem().removeItem(snap['line'])
         self.snapshots.clear()
-        self.draw_idle()
 
-    def update_plot(self, plot_data: PlotData, show_baseline: bool = True, normalize: bool = True, det_idx: int = 0):
-        """Update the canvas with data for a single detector"""
+    # ------------------------------------------------------------------ #
+    # Main update                                                           #
+    # ------------------------------------------------------------------ #
+
+    def update_plot(self, plot_data: PlotData,
+                    show_baseline: bool = True,
+                    normalize: bool = True,
+                    det_idx: int = 0):
+        self.getPlotItem().setTitle(f'Detector {det_idx}')
+
         if plot_data is None or not plot_data.has_data:
-            self.line.set_data([], [])
-            self.scatter.set_offsets(np.empty((0, 2)))
-            self.fwhm_lc.set_segments([])
-            self.baseline_lc.set_segments([])
+            self.line.setData([], [])
+            self.scatter.setData([], [])
+            self.fwhm_lc.setData([], [])
+            self.baseline_lc.setData([], [])
             for al in self.adj_lines:
-                al.set_data([], [])
-            self.text_obj.set_text('N/A')
-            self.text_obj.set_color(COLOR_GRAY)
-            self.text_obj.set_visible(True)
-            self.ax.set_facecolor('white')
-            self.draw_idle()
+                al.setData([], [])
+            self._show_overlay('N/A', COLOR_GRAY)
             return
 
         if not plot_data.is_enabled:
-            self.line.set_data([], [])
-            self.scatter.set_offsets(np.empty((0, 2)))
-            self.fwhm_lc.set_segments([])
-            self.baseline_lc.set_segments([])
+            self.line.setData([], [])
+            self.scatter.setData([], [])
+            self.fwhm_lc.setData([], [])
+            self.baseline_lc.setData([], [])
             for al in self.adj_lines:
-                al.set_data([], [])
-            self.text_obj.set_text('OFF')
-            self.text_obj.set_color(COLOR_DISABLED)
-            self.text_obj.set_visible(True)
-            self.ax.set_facecolor('#ffeeee')
-            self.draw_idle()
+                al.setData([], [])
+            self._show_overlay('OFF', COLOR_DISABLED, '#ffeeee')
             return
 
-        self.text_obj.set_visible(False)
-        self.ax.set_facecolor('white')
+        self._hide_overlay()
 
         if len(plot_data.samples) > 0:
-            self.line.set_data(plot_data.samples, plot_data.values)
+            self.line.setData(plot_data.samples, plot_data.values)
             if not self._user_navigated:
-                xmin = float(plot_data.samples[0])
-                xmax = float(plot_data.samples[-1])
-                if xmax > xmin:
-                    self.ax.set_xlim([xmin, xmax])
+                x_min = float(plot_data.samples[0])
+                x_max = float(plot_data.samples[-1])
+                if x_max > x_min:
+                    self.setXRange(x_min, x_max, padding=0)
                 if normalize:
-                    self.ax.set_ylim([-0.1, 1.1])
+                    self.setYRange(-0.1, 1.1, padding=0)
                 else:
-                    self.ax.relim()
-                    self.ax.autoscale_view(scalex=False, scaley=True)
+                    self.getPlotItem().enableAutoRange(axis='y')
         else:
-            self.line.set_data([], [])
+            self.line.setData([], [])
 
-        if plot_data.peak_positions is not None:
-            self.scatter.set_offsets(plot_data.peak_positions)
+        if plot_data.peak_positions is not None and len(plot_data.peak_positions) > 0:
+            self.scatter.setData(x=plot_data.peak_positions[:, 0],
+                                 y=plot_data.peak_positions[:, 1])
         else:
-            self.scatter.set_offsets(np.empty((0, 2)))
+            self.scatter.setData([], [])
 
         if plot_data.fwhm_lines is not None and len(plot_data.fwhm_lines) > 0:
-            segments = []
-            for fwhm in plot_data.fwhm_lines:
-                pos, widthL, widthR, half_height = fwhm
-                segments.append([(pos + widthL, half_height), (pos + widthR, half_height)])
-            self.fwhm_lc.set_segments(segments)
+            xs, ys = [], []
+            for pos, wl, wr, hh in plot_data.fwhm_lines:
+                xs += [pos + wl, pos + wr]
+                ys += [hh, hh]
+            self.fwhm_lc.setData(np.asarray(xs), np.asarray(ys))
         else:
-            self.fwhm_lc.set_segments([])
+            self.fwhm_lc.setData([], [])
 
         if show_baseline and plot_data.baseline_data:
-            bl_segments = []
-            for peak_idx, bd in enumerate(plot_data.baseline_data):
-                bl_segments.append([(bd['bl_x'][0], bd['bl_y'][0]),
-                                     (bd['bl_x'][1], bd['bl_y'][1])])
-                if peak_idx < len(self.adj_lines):
-                    self.adj_lines[peak_idx].set_data(bd['adj_x'], bd['adj_y'])
-            self.baseline_lc.set_segments(bl_segments)
-            n_peaks = len(plot_data.baseline_data)
-            for k in range(n_peaks, len(self.adj_lines)):
-                self.adj_lines[k].set_data([], [])
+            xs_bl, ys_bl = [], []
+            for k, bd in enumerate(plot_data.baseline_data):
+                xs_bl += [bd['bl_x'][0], bd['bl_x'][1]]
+                ys_bl += [bd['bl_y'][0], bd['bl_y'][1]]
+                if k < len(self.adj_lines):
+                    self.adj_lines[k].setData(bd['adj_x'], bd['adj_y'])
+            self.baseline_lc.setData(np.asarray(xs_bl), np.asarray(ys_bl))
+            for k in range(len(plot_data.baseline_data), len(self.adj_lines)):
+                self.adj_lines[k].setData([], [])
         else:
-            self.baseline_lc.set_segments([])
+            self.baseline_lc.setData([], [])
             for al in self.adj_lines:
-                al.set_data([], [])
+                al.setData([], [])
 
         # Update snapshot lines for the active detector
         for snap in self.snapshots:
             pdl = snap['plot_data_list']
             if det_idx < len(pdl):
-                pd_snap = pdl[det_idx]
-                if pd_snap.has_data and pd_snap.is_enabled and len(pd_snap.samples) > 0:
-                    snap['line'].set_data(pd_snap.samples, pd_snap.values)
+                pd_s = pdl[det_idx]
+                if pd_s.has_data and pd_s.is_enabled and len(pd_s.samples) > 0:
+                    snap['line'].setData(pd_s.samples, pd_s.values)
                 else:
-                    snap['line'].set_data([], [])
+                    snap['line'].setData([], [])
             else:
-                snap['line'].set_data([], [])
-
-        self.draw_idle()
+                snap['line'].setData([], [])
 
 
-class HistoryCanvas(FigureCanvasQTAgg):
-    """Scrolling shot-history canvas.
+# ---------------------------------------------------------------------------
+# HistoryCanvas
+# ---------------------------------------------------------------------------
 
-    Shows five stacked subplots (sharing the x-axis = shot number):
-      Plin | φ (°) | β | Peak position per detector | Peak height per detector
-
-    Auto-scrolls to the last *window* shots by default.  Once the user
-    zooms/pans manually (``_user_xlim = True``) the xlim is no longer
-    overridden, and if the view extends beyond what is in RAM
-    ``on_range_request(shot_start, shot_end)`` is called so the caller can
-    load older records from the dump file.
-
-    Call ``reset_view()`` (or patch the toolbar's Home button) to re-enable
-    auto-scrolling.
-    """
+class HistoryCanvas(pg.GraphicsLayoutWidget):
+    """Shot-history canvas: five stacked plots sharing the x-axis."""
 
     def __init__(self, parent=None, width=10, height=8, dpi=100, n_detectors=16):
-        self.fig = Figure(figsize=(width, height), dpi=dpi)
+        super().__init__(parent=parent)
+        self.setViewport(QWidget())  # force software rendering (no OpenGL)
         self.n_detectors = n_detectors
 
-        # Five subplots sharing the x-axis
-        self.ax_plin   = self.fig.add_subplot(5, 1, 1)
-        self.ax_phi    = self.fig.add_subplot(5, 1, 2, sharex=self.ax_plin)
-        self.ax_beta   = self.fig.add_subplot(5, 1, 3, sharex=self.ax_plin)
-        self.ax_pos    = self.fig.add_subplot(5, 1, 4, sharex=self.ax_plin)
-        self.ax_height = self.fig.add_subplot(5, 1, 5, sharex=self.ax_plin)
+        self.ax_plin   = self.addPlot(row=0, col=0)
+        self.ax_phi    = self.addPlot(row=1, col=0)
+        self.ax_beta   = self.addPlot(row=2, col=0)
+        self.ax_pos    = self.addPlot(row=3, col=0)
+        self.ax_height = self.addPlot(row=4, col=0)
 
-        _labels = ['Plin', 'φ (°)', 'β', 'Pos.', 'Height']
+        self.ax_phi.setXLink(self.ax_plin)
+        self.ax_beta.setXLink(self.ax_plin)
+        self.ax_pos.setXLink(self.ax_plin)
+        self.ax_height.setXLink(self.ax_plin)
+
         for ax, lbl in zip(
             [self.ax_plin, self.ax_phi, self.ax_beta, self.ax_pos, self.ax_height],
-            _labels,
+            ['Plin', '\u03c6 (\u00b0)', '\u03b2', 'Pos.', 'Height'],
         ):
-            ax.set_ylabel(lbl, fontsize=8)
-            ax.grid(True, alpha=0.3)
-            ax.tick_params(labelsize=7)
-            ax.ticklabel_format(style='plain', useOffset=False)
+            ax.setLabel('left', lbl)
+            ax.showGrid(x=True, y=True, alpha=0.3)
+            ax.hideButtons()
 
-        self.ax_height.set_xlabel('Shot', fontsize=8)
+        self.ax_height.setLabel('bottom', 'Shot')
 
-        # Global-fit lines (single line each)
-        (self.line_plin,)  = self.ax_plin.plot([], [], color='steelblue', linewidth=1.0)
-        (self.line_phi,)   = self.ax_phi.plot([], [], color='seagreen', linewidth=1.0)
-        (self.line_beta,)  = self.ax_beta.plot([], [], color='firebrick', linewidth=1.0)
+        self.line_plin = self.ax_plin.plot([], [], pen=_pen('#4477aa', width=1.0))
+        self.line_phi  = self.ax_phi.plot([], [], pen=_pen('#228833', width=1.0))
+        self.line_beta = self.ax_beta.plot([], [], pen=_pen('#bb5566', width=1.0))
 
-        # Per-detector lines for pos and height
         self.lines_pos:    dict = {}
         self.lines_height: dict = {}
         self._build_det_lines()
 
-        self.fig.tight_layout(pad=0.5, h_pad=0.3)
-        super().__init__(self.fig)
-
-        # Callable invoked when the user pans/zooms into shots not in RAM.
-        # Signature: fn(shot_start: int, shot_end: int) -> None
         self.on_range_request = None
-
         self._memory_start_shot: int = 0
-        self._suppressing_xlim: bool = False
-        self._user_xlim:        bool = False
+        self._user_xlim: bool = False
 
-        self.ax_plin.callbacks.connect('xlim_changed', self._on_xlim_changed)
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+        self.ax_plin.getViewBox().sigRangeChangedManually.connect(
+            self._on_range_changed_manually)
 
     def _build_det_lines(self):
-        """(Re-)create per-detector Line2D objects for pos and height axes."""
         for line in list(self.lines_pos.values()) + list(self.lines_height.values()):
             try:
-                line.remove()
+                self.ax_pos.removeItem(line)
+            except Exception:
+                pass
+            try:
+                self.ax_height.removeItem(line)
             except Exception:
                 pass
         self.lines_pos.clear()
         self.lines_height.clear()
 
-        cmap = matplotlib.cm.tab20
-        n = max(self.n_detectors, 1)
         for det_id in range(self.n_detectors):
-            color = cmap(det_id / n)
-            (lp,) = self.ax_pos.plot([], [], color=color, linewidth=0.8,
-                                     alpha=0.85, label=f'D{det_id}')
-            (lh,) = self.ax_height.plot([], [], color=color, linewidth=0.8,
-                                        alpha=0.85, label=f'D{det_id}')
+            color = _DET_PALETTE[det_id % len(_DET_PALETTE)]
+            lp = self.ax_pos.plot([], [], pen=_pen(color, width=0.8, alpha=217))
+            lh = self.ax_height.plot([], [], pen=_pen(color, width=0.8, alpha=217))
             self.lines_pos[det_id]    = lp
             self.lines_height[det_id] = lh
 
-    # ------------------------------------------------------------------
-    # xlim callback — detects manual user zoom / pan
-    # ------------------------------------------------------------------
-
-    def _on_xlim_changed(self, ax):
-        if self._suppressing_xlim:
-            return
+    def _on_range_changed_manually(self, vb, ranges):
         self._user_xlim = True
-        xlim = ax.get_xlim()
+        xlim = self.ax_plin.getViewBox().viewRange()[0]
         shot_start = int(np.floor(xlim[0]))
         shot_end   = int(np.ceil(xlim[1]))
         if shot_start < self._memory_start_shot and self.on_range_request is not None:
             self.on_range_request(shot_start, shot_end)
 
     def reset_view(self):
-        """Re-enable auto-scrolling (call after toolbar Home or a manual reset)."""
         self._user_xlim = False
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     def set_n_detectors(self, n: int):
-        """Rebuild per-detector lines when the detector count changes."""
         self.n_detectors = n
         self._build_det_lines()
-        self.draw_idle()
 
-    def update_history(
-        self,
-        df: pd.DataFrame,
-        memory_start_shot: int = 0,
-        enabled_detectors=None,
-        window: Optional[int] = 100,
-    ):
-        """Redraw all channels from *df* (columns: shot, Plin, phi, beta,
-        pos_N, height_N for each detector N).
-
-        *window*: when set and the user has not manually zoomed, the xlim
-        scrolls to show the last *window* shots.
-        """
+    def update_history(self, df: pd.DataFrame,
+                       memory_start_shot: int = 0,
+                       enabled_detectors=None,
+                       window: Optional[int] = 100):
         if df is None or df.empty:
             return
 
@@ -1304,11 +1192,10 @@ class HistoryCanvas(FigureCanvasQTAgg):
 
         def _upd(line, ax, col):
             if col in df.columns:
-                line.set_data(shots, df[col].values.astype(float))
+                line.setData(shots, df[col].values.astype(float))
             else:
-                line.set_data([], [])
-            ax.relim()
-            ax.autoscale_view(scalex=False, scaley=True)
+                line.setData([], [])
+            ax.enableAutoRange(axis='y')
 
         _upd(self.line_plin,  self.ax_plin,  'Plin')
         _upd(self.line_phi,   self.ax_phi,   'phi')
@@ -1316,7 +1203,7 @@ class HistoryCanvas(FigureCanvasQTAgg):
 
         any_pos = any_height = False
         for det_id in range(self.n_detectors):
-            show = enabled_detectors is None or det_id in enabled_detectors
+            show = (enabled_detectors is None or det_id in enabled_detectors)
             lp = self.lines_pos.get(det_id)
             lh = self.lines_height.get(det_id)
             col_p = f'pos_{det_id}'
@@ -1324,41 +1211,31 @@ class HistoryCanvas(FigureCanvasQTAgg):
 
             if lp is not None:
                 if show and col_p in df.columns:
-                    lp.set_data(shots, df[col_p].values.astype(float))
-                    lp.set_visible(True)
+                    lp.setData(shots, df[col_p].values.astype(float))
+                    lp.setVisible(True)
                     any_pos = True
                 else:
-                    lp.set_data([], [])
-                    lp.set_visible(False)
+                    lp.setData([], [])
+                    lp.setVisible(False)
 
             if lh is not None:
                 if show and col_h in df.columns:
-                    lh.set_data(shots, df[col_h].values.astype(float))
-                    lh.set_visible(True)
+                    lh.setData(shots, df[col_h].values.astype(float))
+                    lh.setVisible(True)
                     any_height = True
                 else:
-                    lh.set_data([], [])
-                    lh.set_visible(False)
+                    lh.setData([], [])
+                    lh.setVisible(False)
 
         if any_pos:
-            self.ax_pos.relim()
-            self.ax_pos.autoscale_view(scalex=False, scaley=True)
+            self.ax_pos.enableAutoRange(axis='y')
         if any_height:
-            self.ax_height.relim()
-            self.ax_height.autoscale_view(scalex=False, scaley=True)
+            self.ax_height.enableAutoRange(axis='y')
 
-        # Auto-scroll when the user has not manually zoomed
         if not self._user_xlim and shots.size > 0 and window is not None and window > 0:
             xmax = float(shots[-1]) + 1.0
             xmin = max(float(shots[0]) - 0.5, xmax - window)
-            self._suppressing_xlim = True
-            self.ax_plin.set_xlim(xmin, xmax)
-            self._suppressing_xlim = False
-
-        self.draw_idle()
+            self.ax_plin.getViewBox().setXRange(xmin, xmax, padding=0)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.fig.tight_layout(pad=0.5, h_pad=0.3)
-        self.draw_idle()
-

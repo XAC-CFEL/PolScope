@@ -38,7 +38,6 @@ class _NoScrollSpinBox(QSpinBox):
 class _NoScrollDoubleSpinBox(QDoubleSpinBox):
     def wheelEvent(self, event):
         event.ignore()
-from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT
 from plotting import FastMplCanvas, PolarPlotCanvas, AngularHeatmapCanvas, SingleDetectorCanvas, HistoryCanvas
 from history import HistoryBuffer
 
@@ -251,20 +250,6 @@ class MainWindow(QMainWindow):
         selector_layout.addStretch()
         single_det_layout.addLayout(selector_layout)
         self.single_det_canvas = SingleDetectorCanvas(self, width=8, height=4, dpi=100)
-        self.single_det_toolbar = NavigationToolbar2QT(self.single_det_canvas, self.single_det_widget)
-        # Patch toolbar so we know when the user has zoomed/panned vs. pressed Home
-        _canvas = self.single_det_canvas
-        _orig_push = self.single_det_toolbar.push_current
-        _orig_home = self.single_det_toolbar.home
-        def _on_push_current():
-            _canvas._user_navigated = True
-            _orig_push()
-        def _on_home(*args, **kwargs):
-            _canvas._user_navigated = False
-            _orig_home(*args, **kwargs)
-        self.single_det_toolbar.push_current = _on_push_current
-        self.single_det_toolbar.home = _on_home
-        single_det_layout.addWidget(self.single_det_toolbar)
         single_det_layout.addWidget(self.single_det_canvas)
         self.tab_widget.addTab(self.single_det_widget, "Single Detector")
 
@@ -277,15 +262,6 @@ class MainWindow(QMainWindow):
         history_plot_layout.setContentsMargins(0, 0, 0, 0)
         self.history_canvas = HistoryCanvas(self, width=10, height=8, dpi=100, n_detectors=16)
         self.history_canvas.on_range_request = self._on_history_range_request
-        self.history_toolbar = NavigationToolbar2QT(self.history_canvas, history_plot_widget)
-        # Patch toolbar Home to re-enable auto-scrolling
-        _hc = self.history_canvas
-        _orig_h_home = self.history_toolbar.home
-        def _on_h_home(*args, **kwargs):
-            _hc.reset_view()
-            _orig_h_home(*args, **kwargs)
-        self.history_toolbar.home = _on_h_home
-        history_plot_layout.addWidget(self.history_toolbar)
         history_plot_layout.addWidget(self.history_canvas)
         history_outer_layout.addWidget(history_plot_widget, stretch=3)
 
@@ -1551,7 +1527,6 @@ class MainWindow(QMainWindow):
         if det_idx < 0 or det_idx >= len(plot_data_list):
             return
         plot_data = plot_data_list[det_idx]
-        self.single_det_canvas.ax.set_title(f'Detector {det_idx}', fontsize=10)
         self.single_det_canvas.update_plot(
             plot_data,
             show_baseline=self.show_baseline_check.isChecked(),
