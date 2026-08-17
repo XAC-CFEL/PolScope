@@ -1,4 +1,5 @@
 import math
+import time
 import numpy as np
 import traceback
 from collections import deque
@@ -66,6 +67,7 @@ class PerformanceMonitor:
         self.process_times = deque(maxlen=10)
         self.plot_prep_times = deque(maxlen=10)
         self.plot_render_times = deque(maxlen=10)
+        self.idle_times = deque(maxlen=10)
         self.thread_times = {}
         self.lock = Lock()
 
@@ -85,6 +87,8 @@ class PerformanceMonitor:
                 self.plot_prep_times.append(duration)
             elif stage == 'plot_render':
                 self.plot_render_times.append(duration)
+            elif stage == 'idle':
+                self.idle_times.append(duration)
 
     def record_thread(self, thread_id, duration):
         with self.lock:
@@ -102,6 +106,7 @@ class PerformanceMonitor:
                 'process_avg': np.mean(self.process_times) if self.process_times else 0,
                 'plot_prep_avg': np.mean(self.plot_prep_times) if self.plot_prep_times else 0,
                 'plot_render_avg': np.mean(self.plot_render_times) if self.plot_render_times else 0,
+                'idle_avg': np.mean(self.idle_times) if self.idle_times else 0,
                 'thread_stats': {}
             }
 
@@ -119,9 +124,10 @@ class PlotPreparationWorker(QObject):
     """Worker for preparing plot data (runs in separate thread)"""
     plot_ready = pyqtSignal(list)  # List of PlotData objects
 
-    def __init__(self, n_detectors):
+    def __init__(self, n_detectors, performance_monitor=None):
         super().__init__()
         self.n_detectors = n_detectors
+        self.performance_monitor = performance_monitor
         self.data_queue = Queue(maxsize=1)
         self.running = True
         self.downsample = 2
@@ -150,6 +156,7 @@ class PlotPreparationWorker(QObject):
                 packet = self.data_queue.get(timeout=0.1)
                 data, normalized_data, results, enabled_detectors, last_train, last_pulse = packet
 
+                prep_start = time.time()
                 plot_data_list = []
                 available_detectors = data.coords['detector'].values
 
@@ -294,6 +301,9 @@ class PlotPreparationWorker(QObject):
                         ))
 
                 # Emit prepared data
+                if self.performance_monitor is not None:
+                    self.performance_monitor.record_stage('plot_prep',
+                                                          time.time() - prep_start)
                 self.plot_ready.emit(plot_data_list)
 
             except Empty:

@@ -860,6 +860,17 @@ class MainWindow(QMainWindow):
         self.heatmap_showpeaks_check.stateChanged.connect(self.on_heatmap_param_changed)
         heatmap_layout.addWidget(self.heatmap_showpeaks_check, row, 0, 1, 2)
 
+        row += 1
+        heatmap_layout.addWidget(QLabel("Resolution:"), row, 0)
+        self.heatmap_res_spin = _NoScrollSpinBox()
+        self.heatmap_res_spin.setRange(0, 1024)
+        self.heatmap_res_spin.setSingleStep(64)
+        self.heatmap_res_spin.setValue(0)
+        self.heatmap_res_spin.setToolTip(
+            "Heatmap raster size (px). 0 = auto (match plot size)")
+        self.heatmap_res_spin.valueChanged.connect(self.on_heatmap_param_changed)
+        heatmap_layout.addWidget(self.heatmap_res_spin, row, 1)
+
         heatmap_group.setLayout(heatmap_layout)
         return heatmap_group
 
@@ -1185,7 +1196,7 @@ class MainWindow(QMainWindow):
         }
 
         # Create plot preparation worker (thread is fine for I/O-bound work)
-        self.plot_worker = PlotPreparationWorker(self.n_detectors)
+        self.plot_worker = PlotPreparationWorker(self.n_detectors, self.performance_monitor)
         self.plot_worker.set_downsample(self.downsample_spin.value())
         self.plot_worker.set_roi(self.roi_start_spin.value(), self.roi_end_spin.value())
         self.plot_worker.plot_ready.connect(self.on_plot_ready)
@@ -1263,6 +1274,9 @@ class MainWindow(QMainWindow):
         new_train = self.data_simulator.get_next_train()  # always drain/advance
         if not load_allowed:
             new_train = None  # pipeline still busy – skip this chunk
+            # The whole tick was spent waiting for the previous batch
+            # (process pool or plot worker) — record it as idle time.
+            self.performance_monitor.record_stage('idle', time.time() - iter_start)
         if new_train is not None:
             self.circular_buffer.push(new_train)
 
@@ -1559,6 +1573,7 @@ class MainWindow(QMainWindow):
             sample_max=self.heatmap_smax_spin.value(),
             interpolate=self.heatmap_interpolate_check.isChecked(),
             show_peaks=self.heatmap_showpeaks_check.isChecked(),
+            resolution=self.heatmap_res_spin.value(),
         )
 
     def update_single_detector_plot(self, plot_data_list):
@@ -1935,6 +1950,7 @@ class MainWindow(QMainWindow):
         text += f"Process:           {stats['process_avg']*1000:.1f} ms\n"
         text += f"Plot prep:         {stats['plot_prep_avg']*1000:.1f} ms\n"
         text += f"Plot render (GUI): {stats['plot_render_avg']*1000:.1f} ms\n"
+        text += f"Idle (busy-wait):  {stats['idle_avg']*1000:.1f} ms\n"
 
         self.perf_text.setPlainText(text)
         # Scroll to top to keep display stable

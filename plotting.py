@@ -17,7 +17,7 @@ Performance notes
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QRectF
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import QWidget
 from scipy.optimize import curve_fit
@@ -697,7 +697,7 @@ class PolarPlotCanvas(pg.PlotWidget):
 # ---------------------------------------------------------------------------
 
 class AngularHeatmapCanvas(pg.GraphicsLayoutWidget):
-    """Polar heatmap using PColorMeshItem (intensity vs angle vs sample pos)."""
+    """Polar heatmap: interpolated ImageItem (fast) or per-detector wedges."""
 
     def __init__(self, parent=None, width=7, height=7, dpi=100):
         super().__init__(parent=parent)
@@ -718,9 +718,21 @@ class AngularHeatmapCanvas(pg.GraphicsLayoutWidget):
         self.angles_rad = np.deg2rad(self.angles_deg)
 
         self._mesh_item: Optional[pg.PColorMeshItem] = None
+        self._img_item: Optional[pg.ImageItem] = None
         self._peak_items: List[pg.GraphicsObject] = []
         self._grid_items: List[pg.PlotDataItem] = []
         self._grid_labels: List[pg.TextItem] = []
+        self._raster_key: Optional[tuple] = None
+        self._raster_maps: Optional[tuple] = None
+        self._margin: Optional[float] = None
+        self.resolution: int = 0  # 0 = auto (match plot size)
+
+        # Persistent peak overlay items (updated in place, never recreated)
+        self._peak_lines = pg.PlotDataItem([], [], pen=_pen('#ff0000', width=0.8),
+                                           connect='pairs')
+        self.plot.addItem(self._peak_lines)
+        self._peak_scatter = pg.ScatterPlotItem(size=6, pen=None, brush=_brush('#ff0000'))
+        self.plot.addItem(self._peak_scatter)
 
     def set_angles(self, angles_deg):
         self.angles_deg = np.array(angles_deg)
@@ -728,60 +740,169 @@ class AngularHeatmapCanvas(pg.GraphicsLayoutWidget):
 
     @staticmethod
     def _build_intensity_grid(traces, angles_rad, n_theta=720):
+        """Periodic linear interpolation of traces vs angle, fully vectorised.
+
+        Equivalent to running np.interp per sample column, but computed as a
+        single fancy-indexed lookup instead of a Python loop (~100x faster
+        for n_theta=720 and n_samples~1000).
+        """
         n_samples = traces.shape[1]
         theta_grid = np.linspace(0, 2 * np.pi, n_theta, endpoint=False)
-        grid = np.zeros((n_theta, n_samples))
+
         sort_idx = np.argsort(angles_rad)
         sorted_angles = angles_rad[sort_idx]
         sorted_traces = traces[sort_idx]
-        for si in range(n_samples):
-            vals = sorted_traces[:, si]
-            xp_ext = np.concatenate([sorted_angles - 2 * np.pi,
-                                      sorted_angles,
-                                      sorted_angles + 2 * np.pi])
-            fp_ext = np.concatenate([vals, vals, vals])
-            grid[:, si] = np.interp(theta_grid, xp_ext, fp_ext)
+
+        xp = np.concatenate([sorted_angles - 2 * np.pi,
+                             sorted_angles,
+                             sorted_angles + 2 * np.pi])     # strictly increasing
+        fp = np.vstack([sorted_traces, sorted_traces, sorted_traces])
+
+        idx = np.clip(np.searchsorted(xp, theta_grid) - 1, 0, len(xp) - 2)
+        t = (theta_grid - xp[idx]) / (xp[idx + 1] - xp[idx])
+        grid = fp[idx] * (1.0 - t)[:, np.newaxis] + fp[idx + 1] * t[:, np.newaxis]
         return grid, theta_grid
 
-    def _rebuild_polar_grid(self, r_min: float, r_max: float):
-        for item in self._grid_items + self._grid_labels:
-            self.plot.removeItem(item)
-        self._grid_items.clear()
-        self._grid_labels.clear()
+    def _raster_maps_for(self, n_theta: int, n_r: int, size: int, r_max: float):
+        """Polar resampling tables (indices, weights, mask), cached.
 
-        gray = _pen('#bbbbbb', width=0.5)
-        theta = np.linspace(0, 2 * np.pi, 300)
-        for r in (r_min, (r_min + r_max) / 2, r_max):
-            item = pg.PlotDataItem(r * np.cos(theta), r * np.sin(theta), pen=gray)
+        The displayed slice [smin..smax] is stretched over the full disk
+        (radius 0..r_max), so the image always starts at the centre with
+        data — no inner hole.  The tables only depend on the grid shape,
+        raster size and outer radius, so they are built once per
+        configuration and reused every frame — the per-frame work is then
+        just 4 gathers + 4 multiplies.
+        """
+        key = (n_theta, n_r, size, r_max)
+        if self._raster_key == key and self._raster_maps is not None:
+            return self._raster_maps
+
+        half = 1.25 * r_max
+        xs = np.linspace(-half, half, size, dtype=np.float32)
+        ys = np.linspace(-half, half, size, dtype=np.float32)
+        yy, xx = np.meshgrid(ys, xs, indexing='ij')
+        r_img = np.hypot(xx, yy)
+        theta_img = np.arctan2(yy, xx) % (2 * np.pi)
+
+        th_idx = theta_img / (2 * np.pi) * n_theta
+        r_idx = r_img / r_max * (n_r - 1)
+        th0 = np.clip(th_idx.astype(np.int32), 0, n_theta - 1)
+        r0 = np.clip(r_idx.astype(np.int32), 0, n_r - 1)
+        th1 = np.clip(th0 + 1, 0, n_theta - 1)
+        r1 = np.clip(r0 + 1, 0, n_r - 1)
+        wt = np.clip(th_idx - th0, 0.0, 1.0)
+        wr = np.clip(r_idx - r0, 0.0, 1.0)
+        mask = r_img > r_max
+
+        # only gather at pixels inside the annulus (masked ones are transparent)
+        valid = np.flatnonzero(~mask)
+        fa = (th0 * n_r + r0).ravel()
+        fb = (th1 * n_r + r0).ravel()
+        fc = (th0 * n_r + r1).ravel()
+        fd = (th1 * n_r + r1).ravel()
+        self._raster_key = key
+        self._raster_maps = (
+            fa[valid], fb[valid], fc[valid], fd[valid],
+            ((1.0 - wt) * (1.0 - wr)).ravel()[valid],
+            (wt * (1.0 - wr)).ravel()[valid],
+            ((1.0 - wt) * wr).ravel()[valid],
+            (wt * wr).ravel()[valid],
+            valid,
+        )
+        return self._raster_maps
+
+    def _display_size(self) -> int:
+        """Square raster resolution: explicit override or matched to plot size."""
+        if getattr(self, 'resolution', 0) > 0:
+            return int(np.clip(self.resolution, 256, 1024))
+        px = int(min(self.plot.width(), self.plot.height()))
+        return int(np.clip(px, 256, 640))
+
+    def _show_interpolated(self, grid, r_min, r_max, cmap, vmin, vmax):
+        """Rasterize the interpolated (theta, r) grid onto a cartesian ImageItem.
+
+        Precomputed bilinear index/weight tables turn each frame into four
+        numpy gathers, producing a single QImage instead of the old
+        720 x n_samples PColorMeshItem (very slow in software rendering).
+        The slice is stretched over the full disk (no hole at the centre).
+        """
+        half = 1.25 * r_max
+        size = self._display_size()
+        n_theta, n_r = grid.shape
+        if n_r < 2:
+            # degenerate single-sample grid: stretch into a thin ring
+            r_max = r_min + max(1e-6, 1e-3 * r_min)
+            grid = np.vstack([grid, grid])
+            n_r = 2
+        tables = self._raster_maps_for(n_theta, n_r, size, float(r_max))
+        ia, ib, ic, id_, w00, w10, w01, w11, valid = tables
+        gf = np.ascontiguousarray(grid, dtype=np.float32).ravel()
+        vals = gf[ia] * w00
+        vals += gf[ib] * w10
+        vals += gf[ic] * w01
+        vals += gf[id_] * w11
+        img = np.full(size * size, np.nan, dtype=np.float32)
+        img[valid] = vals
+        img = img.reshape(size, size)
+
+        half = 1.25 * r_max
+        if self._img_item is None:
+            item = pg.ImageItem()
+            item.setColorMap(cmap)
             self.plot.addItem(item)
-            self._grid_items.append(item)
+            self._img_item = item
+        else:
+            item = self._img_item
+        item.setImage(img, autoLevels=False, levels=(vmin, vmax))
+        item.setRect(QRectF(-half, -half, 2 * half, 2 * half))
 
-        for deg in range(0, 360, 45):
+    def _update_polar_grid(self, r_min: float, r_max: float):
+        """Create once / update in place the polar grid circles, rays, labels."""
+        theta = np.linspace(0, 2 * np.pi, 300)
+        if not self._grid_items:
+            gray = _pen('#bbbbbb', width=0.5)
+            for _ in range(3):
+                item = pg.PlotDataItem([], [], pen=gray)
+                self.plot.addItem(item)
+                self._grid_items.append(item)
+            for deg in range(0, 360, 45):
+                rad = np.deg2rad(deg)
+                ray = pg.PlotDataItem([], [], pen=gray)
+                self.plot.addItem(ray)
+                self._grid_items.append(ray)
+                lbl = pg.TextItem(f'{deg}\u00b0', anchor=(0.5, 0.5), color='#555555')
+                self.plot.addItem(lbl)
+                self._grid_labels.append(lbl)
+
+        for i, r in enumerate((r_min, (r_min + r_max) / 2, r_max)):
+            self._grid_items[i].setData(r * np.cos(theta), r * np.sin(theta))
+        for j, deg in enumerate(range(0, 360, 45)):
             rad = np.deg2rad(deg)
-            ray = pg.PlotDataItem(
-                [r_min * np.cos(rad), r_max * np.cos(rad)],
-                [r_min * np.sin(rad), r_max * np.sin(rad)],
-                pen=gray)
-            self.plot.addItem(ray)
-            self._grid_items.append(ray)
-            lbl = pg.TextItem(f'{deg}\u00b0', anchor=(0.5, 0.5), color='#555555')
-            lbl.setPos(1.12 * r_max * np.cos(rad), 1.12 * r_max * np.sin(rad))
-            self.plot.addItem(lbl)
-            self._grid_labels.append(lbl)
+            ray = self._grid_items[3 + j]
+            ray.setData([r_min * np.cos(rad), r_max * np.cos(rad)],
+                        [r_min * np.sin(rad), r_max * np.sin(rad)])
+            self._grid_labels[j].setPos(1.12 * r_max * np.cos(rad),
+                                        1.12 * r_max * np.sin(rad))
 
         margin = 1.25 * r_max
-        self.plot.setXRange(-margin, margin, padding=0)
-        self.plot.setYRange(-margin, margin, padding=0)
+        if self._margin != margin:
+            self._margin = margin
+            self.plot.setXRange(-margin, margin, padding=0)
+            self.plot.setYRange(-margin, margin, padding=0)
 
     def update_heatmap(self, plot_data_list: List['PlotData'],
                        results_df,
                        sample_min: int, sample_max: int,
                        interpolate: bool = True,
-                       show_peaks: bool = True):
+                       show_peaks: bool = True,
+                       resolution: int = 0):
         # Remove previous dynamic items
-        if self._mesh_item is not None:
-            self.plot.removeItem(self._mesh_item)
-            self._mesh_item = None
+        self.resolution = int(resolution)
+        if not interpolate:
+            # wedges replace the interpolated image entirely
+            if self._img_item is not None:
+                self.plot.removeItem(self._img_item)
+                self._img_item = None
         for item in self._peak_items:
             self.plot.removeItem(item)
         self._peak_items.clear()
@@ -821,22 +942,20 @@ class AngularHeatmapCanvas(pg.GraphicsLayoutWidget):
         r_edges = np.concatenate([[sample_coords[0] - dr / 2],
                                    sample_coords + dr / 2])
 
+        # Map the displayed slice [smin..smax] onto the full disk (radius 0..smax)
+        # so the plot always starts with data at the centre (no inner hole).
+        rmin_abs = float(sample_coords[0])
+        rmax_abs = float(sample_coords[-1])
+        span = max(rmax_abs - rmin_abs, 1e-9)
+        rmap = lambda r: (r - rmin_abs) * (rmax_abs / span)
+
         vmin = float(traces.min())
         vmax = float(traces.max()) if traces.max() > vmin else vmin + 1e-9
         cmap = pg.colormap.get('viridis')
 
         if interpolate:
-            grid, theta_grid = self._build_intensity_grid(traces, angles_rad, n_theta=720)
-            d_theta = theta_grid[1] - theta_grid[0]
-            theta_edges = np.append(theta_grid - d_theta / 2,
-                                    theta_grid[-1] + d_theta / 2)   # (721,)
-            th_m, r_m = np.meshgrid(theta_edges, r_edges, indexing='ij')  # (721, ns+1)
-            x_mesh = r_m * np.cos(th_m)
-            y_mesh = r_m * np.sin(th_m)
-            mesh = pg.PColorMeshItem(x_mesh, y_mesh, grid,
-                                     colorMap=cmap, levels=(vmin, vmax))
-            self.plot.addItem(mesh)
-            self._mesh_item = mesh
+            grid, _ = self._build_intensity_grid(traces, angles_rad, n_theta=720)
+            self._show_interpolated(grid, rmin_abs, rmax_abs, cmap, vmin, vmax)
         else:
             n_dets = len(det_ids)
             if n_dets > 1:
@@ -854,7 +973,8 @@ class AngularHeatmapCanvas(pg.GraphicsLayoutWidget):
             for k in range(n_dets):
                 ang = angles_rad[k]
                 th_e = np.array([ang - wl[k], ang + wr[k]])
-                th_m, r_m = np.meshgrid(th_e, r_edges, indexing='ij')
+                r_d = np.clip(rmap(r_edges), 0.0, None)
+                th_m, r_m = np.meshgrid(th_e, r_d, indexing='ij')
                 x_w = r_m * np.cos(th_m)
                 y_w = r_m * np.sin(th_m)
                 z_w = traces[k, :][np.newaxis, :]
@@ -864,32 +984,36 @@ class AngularHeatmapCanvas(pg.GraphicsLayoutWidget):
                 self._peak_items.append(item)
 
         # Rebuild polar grid
-        self._rebuild_polar_grid(float(sample_coords[0]), float(sample_coords[-1]))
+        self._update_polar_grid(rmap(rmin_abs), rmap(rmax_abs))
 
-        # Peak overlay
+        # Peak overlay (persistent items, updated in place)
         if show_peaks and results_df is not None and not results_df.empty:
-            px_list, py_list = [], []
+            seg_x, seg_y, px_list, py_list = [], [], [], []
             for _, row in results_df.iterrows():
                 det = int(row['detector'])
                 if det >= len(self.angles_rad):
                     continue
                 ang = self.angles_rad[det]
-                pos = row['pos']
-                wl_p = row['width left']
-                wr_p = row['width right']
-                px_list.append(pos * np.cos(ang))
-                py_list.append(pos * np.sin(ang))
-                wline = pg.PlotDataItem(
-                    [(pos + wl_p) * np.cos(ang), (pos + wr_p) * np.cos(ang)],
-                    [(pos + wl_p) * np.sin(ang), (pos + wr_p) * np.sin(ang)],
-                    pen=_pen('#ff0000', width=0.8))
-                self.plot.addItem(wline)
-                self._peak_items.append(wline)
+                pos = float(row['pos'])
+                wl_p = float(row['width left'])
+                wr_p = float(row['width right'])
+                p_d = float(np.clip(rmap(pos), 0.0, rmax_abs))
+                wl_d = float(np.clip(rmap(pos + wl_p), 0.0, rmax_abs)) - p_d
+                wr_d = float(np.clip(rmap(pos + wr_p), 0.0, rmax_abs)) - p_d
+                px_list.append(p_d * np.cos(ang))
+                py_list.append(p_d * np.sin(ang))
+                seg_x += [(p_d + wl_d) * np.cos(ang), (p_d + wr_d) * np.cos(ang)]
+                seg_y += [(p_d + wl_d) * np.sin(ang), (p_d + wr_d) * np.sin(ang)]
+            self._peak_lines.setData(seg_x, seg_y)
+            self._peak_lines.setVisible(True)
             if px_list:
-                sc = pg.ScatterPlotItem(x=px_list, y=py_list,
-                                        size=6, pen=None, brush=_brush('#ff0000'))
-                self.plot.addItem(sc)
-                self._peak_items.append(sc)
+                self._peak_scatter.setData(x=px_list, y=py_list)
+                self._peak_scatter.setVisible(True)
+            else:
+                self._peak_scatter.setVisible(False)
+        else:
+            self._peak_lines.setVisible(False)
+            self._peak_scatter.setVisible(False)
 
 
 # ---------------------------------------------------------------------------
