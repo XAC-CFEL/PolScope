@@ -229,13 +229,39 @@ class MainWindow(QMainWindow):
         self.results_table.setAlternatingRowColors(True)
         self.tab_widget.addTab(self.results_table, "Results")
 
-        # Tab 3: Polarization Plot
+        # Tab 3: Polarization Plot + its settings
+        self.polar_widget = QWidget()
+        polar_outer_layout = QHBoxLayout(self.polar_widget)
         self.polar_canvas = PolarPlotCanvas(self, width=6, height=6, dpi=100)
-        self.tab_widget.addTab(self.polar_canvas, "Polarization")
+        polar_outer_layout.addWidget(self.polar_canvas, stretch=3)
 
-        # Tab 3: Angular Heatmap
+        polar_settings_outer = QWidget()
+        polar_settings_outer.setMinimumWidth(210)
+        polar_settings_outer.setMaximumWidth(240)
+        polar_settings_outer_layout = QVBoxLayout(polar_settings_outer)
+        polar_settings_outer_layout.setContentsMargins(0, 0, 0, 0)
+        polar_settings_outer_layout.addWidget(self.create_polar_settings_group())
+        polar_settings_outer_layout.addStretch()
+        polar_outer_layout.addWidget(polar_settings_outer, stretch=0)
+
+        self.tab_widget.addTab(self.polar_widget, "Polarization")
+
+        # Tab 4: Angular Heatmap + its settings
+        self.heatmap_widget = QWidget()
+        heatmap_outer_layout = QHBoxLayout(self.heatmap_widget)
         self.heatmap_canvas = AngularHeatmapCanvas(self, width=7, height=7, dpi=100)
-        self.tab_widget.addTab(self.heatmap_canvas, "Angular Heatmap")
+        heatmap_outer_layout.addWidget(self.heatmap_canvas, stretch=3)
+
+        heatmap_settings_outer = QWidget()
+        heatmap_settings_outer.setMinimumWidth(210)
+        heatmap_settings_outer.setMaximumWidth(240)
+        heatmap_settings_outer_layout = QVBoxLayout(heatmap_settings_outer)
+        heatmap_settings_outer_layout.setContentsMargins(0, 0, 0, 0)
+        heatmap_settings_outer_layout.addWidget(self.create_heatmap_settings_group())
+        heatmap_settings_outer_layout.addStretch()
+        heatmap_outer_layout.addWidget(heatmap_settings_outer, stretch=0)
+
+        self.tab_widget.addTab(self.heatmap_widget, "Angular Heatmap")
 
         # Tab 4: Single Detector (interactive zoom/pan)
         self.single_det_widget = QWidget()
@@ -334,6 +360,9 @@ class MainWindow(QMainWindow):
         history_outer_layout.addWidget(hist_ctrl_outer, stretch=0)
 
         self.tab_widget.addTab(self.history_widget, "History")
+
+        # Tab 7: Settings (pipeline/performance parameters)
+        self.tab_widget.addTab(self.create_settings_panel(), "Settings")
 
         # Connect tab change signal to update results when Results tab is selected
         self.tab_widget.currentChanged.connect(self.on_tab_changed)
@@ -436,37 +465,6 @@ class MainWindow(QMainWindow):
         self.buffer_enable_check.setChecked(False)
         self.buffer_enable_check.stateChanged.connect(self.on_buffer_enable_changed)
         param_layout.addWidget(self.buffer_enable_check, row, 0, 1, 2)
-
-        row += 1
-        param_layout.addWidget(QLabel("Detectors/Thread:"), row, 0)
-        self.det_per_thread_spin = _NoScrollSpinBox()
-        self.det_per_thread_spin.setRange(1, 16)
-        self.det_per_thread_spin.setValue(4)
-        param_layout.addWidget(self.det_per_thread_spin, row, 1)
-
-        row += 1
-        param_layout.addWidget(QLabel("Pipeline Depth:"), row, 0)
-        self.pipeline_depth_spin = _NoScrollSpinBox()
-        self.pipeline_depth_spin.setRange(1, 10)
-        self.pipeline_depth_spin.setValue(3)
-        self.pipeline_depth_spin.setToolTip("Number of processing batches that can run in parallel")
-        param_layout.addWidget(self.pipeline_depth_spin, row, 1)
-
-        row += 1
-        param_layout.addWidget(QLabel("Update Rate (Hz):"), row, 0)
-        self.update_rate_spin = _NoScrollSpinBox()
-        self.update_rate_spin.setRange(1, 50)
-        self.update_rate_spin.setValue(10)
-        self.update_rate_spin.valueChanged.connect(self.on_update_rate_changed)
-        param_layout.addWidget(self.update_rate_spin, row, 1)
-
-        row += 1
-        param_layout.addWidget(QLabel("Plot Downsample:"), row, 0)
-        self.downsample_spin = _NoScrollSpinBox()
-        self.downsample_spin.setRange(1, 20)
-        self.downsample_spin.setValue(1)
-        self.downsample_spin.valueChanged.connect(self.on_downsample_changed)
-        param_layout.addWidget(self.downsample_spin, row, 1)
 
         row += 1
         param_layout.addWidget(QLabel("Peak Threshold:"), row, 0)
@@ -610,117 +608,6 @@ class MainWindow(QMainWindow):
         self.pulse_stack_stop_spin.setEnabled(_stack_enabled)
         self.pulse_stack_step_spin.setEnabled(_stack_enabled)
 
-        # Polarization Plot Parameters
-        polar_group = QGroupBox("Polarization Plot")
-        polar_layout = QGridLayout()
-
-        row = 0
-        polar_layout.addWidget(QLabel("Peak Number:"), row, 0)
-        self.polar_peak_spin = _NoScrollSpinBox()
-        self.polar_peak_spin.setRange(0, 19)
-        self.polar_peak_spin.setValue(0)
-        self.polar_peak_spin.valueChanged.connect(self.on_polar_param_changed)
-        polar_layout.addWidget(self.polar_peak_spin, row, 1)
-
-        row += 1
-        polar_layout.addWidget(QLabel("Value Type:"), row, 0)
-        self.polar_value_combo = QComboBox()
-        self.polar_value_combo.addItems(["height", "fwhm area"])
-        self.polar_value_combo.currentTextChanged.connect(self.on_polar_param_changed)
-        polar_layout.addWidget(self.polar_value_combo, row, 1)
-
-        row += 1
-        polar_layout.addWidget(QLabel("Beta (β):"), row, 0)
-        self.polar_beta_spin = _NoScrollDoubleSpinBox()
-        self.polar_beta_spin.setRange(-2.0, 2.0)
-        self.polar_beta_spin.setSingleStep(0.1)
-        self.polar_beta_spin.setDecimals(4)
-        # Load default beta from config
-        calibrate_config = GlobalConfig.get_for_class('Calibrate')
-        default_beta = calibrate_config.get('beta', 2.0) if calibrate_config else 2.0
-        self.polar_beta_spin.setValue(default_beta)
-        self.polar_beta_spin.valueChanged.connect(self.on_polar_param_changed)
-        polar_layout.addWidget(self.polar_beta_spin, row, 1)
-
-        # Fit-mode radio buttons
-        row += 1
-        self.polar_fit_plin_radio = QRadioButton("Fit Plin")
-        self.polar_fit_beta_radio = QRadioButton("Fit Beta")
-        self.polar_fit_plin_radio.setChecked(True)
-        self._polar_fit_mode_group = QButtonGroup(self)
-        self._polar_fit_mode_group.addButton(self.polar_fit_plin_radio, 0)
-        self._polar_fit_mode_group.addButton(self.polar_fit_beta_radio, 1)
-        self._polar_fit_mode_group.idToggled.connect(self._on_fit_mode_changed)
-        radio_row = QHBoxLayout()
-        radio_row.addWidget(self.polar_fit_plin_radio)
-        radio_row.addWidget(self.polar_fit_beta_radio)
-        polar_layout.addLayout(radio_row, row, 0, 1, 2)
-
-        row += 1
-        polar_layout.addWidget(QLabel("Plin (fixed):"), row, 0)
-        self.polar_plin_spin = _NoScrollDoubleSpinBox()
-        self.polar_plin_spin.setRange(0.0, 1.0)
-        self.polar_plin_spin.setSingleStep(0.01)
-        self.polar_plin_spin.setDecimals(4)
-        self.polar_plin_spin.setValue(1.0)
-        self.polar_plin_spin.setEnabled(False)  # disabled in Fit Plin mode
-        self.polar_plin_spin.valueChanged.connect(self.on_polar_param_changed)
-        polar_layout.addWidget(self.polar_plin_spin, row, 1)
-
-        row += 1
-        self.polar_fix_phi_check = QCheckBox("Fix φ")
-        self.polar_fix_phi_check.setChecked(False)
-        self.polar_fix_phi_check.stateChanged.connect(self._on_fix_phi_changed)
-        polar_layout.addWidget(self.polar_fix_phi_check, row, 0)
-
-        self.polar_phi_spin = _NoScrollDoubleSpinBox()
-        self.polar_phi_spin.setRange(-180.0, 180.0)
-        self.polar_phi_spin.setSingleStep(1.0)
-        self.polar_phi_spin.setDecimals(1)
-        self.polar_phi_spin.setSuffix(" °")
-        self.polar_phi_spin.setValue(0.0)
-        self.polar_phi_spin.setEnabled(False)  # enabled only when Fix φ is checked
-        self.polar_phi_spin.valueChanged.connect(self.on_polar_param_changed)
-        polar_layout.addWidget(self.polar_phi_spin, row, 1)
-
-        polar_group.setLayout(polar_layout)
-        layout.addWidget(polar_group)
-
-        # Angular Heatmap Parameters
-        heatmap_group = QGroupBox("Angular Heatmap")
-        heatmap_layout = QGridLayout()
-
-        row = 0
-        heatmap_layout.addWidget(QLabel("Sample Min:"), row, 0)
-        self.heatmap_smin_spin = _NoScrollSpinBox()
-        self.heatmap_smin_spin.setRange(0, 10000)
-        self.heatmap_smin_spin.setValue(0)
-        self.heatmap_smin_spin.valueChanged.connect(self.on_heatmap_param_changed)
-        heatmap_layout.addWidget(self.heatmap_smin_spin, row, 1)
-
-        row += 1
-        heatmap_layout.addWidget(QLabel("Sample Max:"), row, 0)
-        self.heatmap_smax_spin = _NoScrollSpinBox()
-        self.heatmap_smax_spin.setRange(0, 10000)
-        self.heatmap_smax_spin.setValue(1000)
-        self.heatmap_smax_spin.valueChanged.connect(self.on_heatmap_param_changed)
-        heatmap_layout.addWidget(self.heatmap_smax_spin, row, 1)
-
-        row += 1
-        self.heatmap_interpolate_check = QCheckBox("Interpolate")
-        self.heatmap_interpolate_check.setChecked(True)
-        self.heatmap_interpolate_check.stateChanged.connect(self.on_heatmap_param_changed)
-        heatmap_layout.addWidget(self.heatmap_interpolate_check, row, 0, 1, 2)
-
-        row += 1
-        self.heatmap_showpeaks_check = QCheckBox("Show Peaks")
-        self.heatmap_showpeaks_check.setChecked(True)
-        self.heatmap_showpeaks_check.stateChanged.connect(self.on_heatmap_param_changed)
-        heatmap_layout.addWidget(self.heatmap_showpeaks_check, row, 0, 1, 2)
-
-        heatmap_group.setLayout(heatmap_layout)
-        layout.addWidget(heatmap_group)
-
         # Calibration
         calib_group = QGroupBox("Intensity Calibration")
         calib_layout = QVBoxLayout()
@@ -861,13 +748,169 @@ class MainWindow(QMainWindow):
         det_group.setLayout(det_outer_layout)
         layout.addWidget(det_group)
 
-        # Performance display
+        layout.addStretch()
+
+        return panel
+
+    def create_polar_settings_group(self):
+        """Polarization plot parameters (shown on the Polarization tab)."""
+        polar_group = QGroupBox("Polarization Settings")
+        polar_layout = QGridLayout()
+
+        row = 0
+        polar_layout.addWidget(QLabel("Peak Number:"), row, 0)
+        self.polar_peak_spin = _NoScrollSpinBox()
+        self.polar_peak_spin.setRange(0, 19)
+        self.polar_peak_spin.setValue(0)
+        self.polar_peak_spin.valueChanged.connect(self.on_polar_param_changed)
+        polar_layout.addWidget(self.polar_peak_spin, row, 1)
+
+        row += 1
+        polar_layout.addWidget(QLabel("Value Type:"), row, 0)
+        self.polar_value_combo = QComboBox()
+        self.polar_value_combo.addItems(["height", "fwhm area"])
+        self.polar_value_combo.currentTextChanged.connect(self.on_polar_param_changed)
+        polar_layout.addWidget(self.polar_value_combo, row, 1)
+
+        row += 1
+        polar_layout.addWidget(QLabel("Beta (β):"), row, 0)
+        self.polar_beta_spin = _NoScrollDoubleSpinBox()
+        self.polar_beta_spin.setRange(-2.0, 2.0)
+        self.polar_beta_spin.setSingleStep(0.1)
+        self.polar_beta_spin.setDecimals(4)
+        calibrate_config = GlobalConfig.get_for_class('Calibrate')
+        default_beta = calibrate_config.get('beta', 2.0) if calibrate_config else 2.0
+        self.polar_beta_spin.setValue(default_beta)
+        self.polar_beta_spin.valueChanged.connect(self.on_polar_param_changed)
+        polar_layout.addWidget(self.polar_beta_spin, row, 1)
+
+        row += 1
+        self.polar_fit_plin_radio = QRadioButton("Fit Plin")
+        self.polar_fit_beta_radio = QRadioButton("Fit Beta")
+        self.polar_fit_plin_radio.setChecked(True)
+        self._polar_fit_mode_group = QButtonGroup(self)
+        self._polar_fit_mode_group.addButton(self.polar_fit_plin_radio, 0)
+        self._polar_fit_mode_group.addButton(self.polar_fit_beta_radio, 1)
+        self._polar_fit_mode_group.idToggled.connect(self._on_fit_mode_changed)
+        radio_row = QHBoxLayout()
+        radio_row.addWidget(self.polar_fit_plin_radio)
+        radio_row.addWidget(self.polar_fit_beta_radio)
+        polar_layout.addLayout(radio_row, row, 0, 1, 2)
+
+        row += 1
+        polar_layout.addWidget(QLabel("Plin (fixed):"), row, 0)
+        self.polar_plin_spin = _NoScrollDoubleSpinBox()
+        self.polar_plin_spin.setRange(0.0, 1.0)
+        self.polar_plin_spin.setSingleStep(0.01)
+        self.polar_plin_spin.setDecimals(4)
+        self.polar_plin_spin.setValue(1.0)
+        self.polar_plin_spin.setEnabled(False)
+        self.polar_plin_spin.valueChanged.connect(self.on_polar_param_changed)
+        polar_layout.addWidget(self.polar_plin_spin, row, 1)
+
+        row += 1
+        self.polar_fix_phi_check = QCheckBox("Fix φ")
+        self.polar_fix_phi_check.setChecked(False)
+        self.polar_fix_phi_check.stateChanged.connect(self._on_fix_phi_changed)
+        polar_layout.addWidget(self.polar_fix_phi_check, row, 0)
+
+        self.polar_phi_spin = _NoScrollDoubleSpinBox()
+        self.polar_phi_spin.setRange(-180.0, 180.0)
+        self.polar_phi_spin.setSingleStep(1.0)
+        self.polar_phi_spin.setDecimals(1)
+        self.polar_phi_spin.setSuffix(" °")
+        self.polar_phi_spin.setValue(0.0)
+        self.polar_phi_spin.setEnabled(False)
+        self.polar_phi_spin.valueChanged.connect(self.on_polar_param_changed)
+        polar_layout.addWidget(self.polar_phi_spin, row, 1)
+
+        polar_group.setLayout(polar_layout)
+        return polar_group
+
+    def create_heatmap_settings_group(self):
+        """Angular heatmap parameters (shown on the Angular Heatmap tab)."""
+        heatmap_group = QGroupBox("Angular Heatmap Settings")
+        heatmap_layout = QGridLayout()
+
+        row = 0
+        heatmap_layout.addWidget(QLabel("Sample Min:"), row, 0)
+        self.heatmap_smin_spin = _NoScrollSpinBox()
+        self.heatmap_smin_spin.setRange(0, 10000)
+        self.heatmap_smin_spin.setValue(0)
+        self.heatmap_smin_spin.valueChanged.connect(self.on_heatmap_param_changed)
+        heatmap_layout.addWidget(self.heatmap_smin_spin, row, 1)
+
+        row += 1
+        heatmap_layout.addWidget(QLabel("Sample Max:"), row, 0)
+        self.heatmap_smax_spin = _NoScrollSpinBox()
+        self.heatmap_smax_spin.setRange(0, 10000)
+        self.heatmap_smax_spin.setValue(1000)
+        self.heatmap_smax_spin.valueChanged.connect(self.on_heatmap_param_changed)
+        heatmap_layout.addWidget(self.heatmap_smax_spin, row, 1)
+
+        row += 1
+        self.heatmap_interpolate_check = QCheckBox("Interpolate")
+        self.heatmap_interpolate_check.setChecked(True)
+        self.heatmap_interpolate_check.stateChanged.connect(self.on_heatmap_param_changed)
+        heatmap_layout.addWidget(self.heatmap_interpolate_check, row, 0, 1, 2)
+
+        row += 1
+        self.heatmap_showpeaks_check = QCheckBox("Show Peaks")
+        self.heatmap_showpeaks_check.setChecked(True)
+        self.heatmap_showpeaks_check.stateChanged.connect(self.on_heatmap_param_changed)
+        heatmap_layout.addWidget(self.heatmap_showpeaks_check, row, 0, 1, 2)
+
+        heatmap_group.setLayout(heatmap_layout)
+        return heatmap_group
+
+    def create_settings_panel(self):
+        """Settings tab: pipeline / performance parameters."""
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+
+        param_group = QGroupBox("Processing Settings")
+        param_layout = QGridLayout()
+
+        row = 0
+        param_layout.addWidget(QLabel("Detectors/Thread:"), row, 0)
+        self.det_per_thread_spin = _NoScrollSpinBox()
+        self.det_per_thread_spin.setRange(1, 16)
+        self.det_per_thread_spin.setValue(4)
+        param_layout.addWidget(self.det_per_thread_spin, row, 1)
+
+        row += 1
+        param_layout.addWidget(QLabel("Pipeline Depth:"), row, 0)
+        self.pipeline_depth_spin = _NoScrollSpinBox()
+        self.pipeline_depth_spin.setRange(1, 10)
+        self.pipeline_depth_spin.setValue(3)
+        self.pipeline_depth_spin.setToolTip("Number of processing batches that can run in parallel")
+        param_layout.addWidget(self.pipeline_depth_spin, row, 1)
+
+        row += 1
+        param_layout.addWidget(QLabel("Update Rate (Hz):"), row, 0)
+        self.update_rate_spin = _NoScrollSpinBox()
+        self.update_rate_spin.setRange(1, 50)
+        self.update_rate_spin.setValue(10)
+        self.update_rate_spin.valueChanged.connect(self.on_update_rate_changed)
+        param_layout.addWidget(self.update_rate_spin, row, 1)
+
+        row += 1
+        param_layout.addWidget(QLabel("Plot Downsample:"), row, 0)
+        self.downsample_spin = _NoScrollSpinBox()
+        self.downsample_spin.setRange(1, 20)
+        self.downsample_spin.setValue(1)
+        self.downsample_spin.valueChanged.connect(self.on_downsample_changed)
+        param_layout.addWidget(self.downsample_spin, row, 1)
+
+        param_group.setLayout(param_layout)
+        layout.addWidget(param_group)
+
         perf_group = QGroupBox("Performance")
         perf_layout = QVBoxLayout()
 
         self.perf_text = QTextEdit()
         self.perf_text.setReadOnly(True)
-        self.perf_text.setMaximumHeight(180)
+        self.perf_text.setMaximumHeight(250)
         font = QFont("Courier")
         font.setPointSize(8)
         self.perf_text.setFont(font)
@@ -877,7 +920,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(perf_group)
 
         layout.addStretch()
-
         return panel
 
     def create_detector_checkboxes(self, n_detectors):

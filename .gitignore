@@ -3,3 +3,4 @@
 /__pycache__
 __pycache__/*.pyc
 history_data/*.csv
+__pycache__/*
