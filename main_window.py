@@ -1910,7 +1910,7 @@ class MainWindow(QMainWindow):
         self.history_canvas.update_history(pd.DataFrame())
         self.history_status_label.setText("0 shots recorded")
 
-
+    def update_results_table(self):
         """Update the results table with current results DataFrame"""
         if self.last_results_df is None or self.last_results_df.empty:
             self.results_table.setRowCount(0)
