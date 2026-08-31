@@ -1,7 +1,5 @@
-temp calib button
-line graph
 ref spektrum
-
+stack pulses fixen
 
 
 replay vom run?
