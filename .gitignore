@@ -1,2 +1,6 @@
 /data
-__pycache__/history.cpython-311.pyc
+/.vscode
+/__pycache__
+__pycache__/*.pyc
+history_data/*.csv
+__pycache__/*
