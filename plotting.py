@@ -693,6 +693,76 @@ class PolarPlotCanvas(pg.PlotWidget):
 
 
 # ---------------------------------------------------------------------------
+# CartesianHeightCanvas
+# ---------------------------------------------------------------------------
+
+class CartesianHeightCanvas(pg.PlotWidget):
+    """Cartesian alternative to the angular heatmap: detector (y) vs sample (x),
+    coloured by trace intensity."""
+
+    def __init__(self, parent=None, width=6, height=6, dpi=100):
+        super().__init__(parent=parent)
+        self.setViewport(QWidget())  # force software rendering (no OpenGL)
+        self.getPlotItem().setTitle('Heatmap (Cartesian)')
+        self.getPlotItem().setLabel('bottom', 'Sample')
+        self.getPlotItem().setLabel('left', 'Detector')
+        self.getPlotItem().hideButtons()
+        self.showGrid(x=False, y=False)
+
+        self.img_item = pg.ImageItem()
+        self.img_item.setColorMap(pg.colormap.get('viridis'))
+        self.addItem(self.img_item)
+
+    def update_cartesian_heatmap(self, plot_data_list: List['PlotData'],
+                                 sample_min: int, sample_max: int):
+        self.img_item.clear()
+
+        det_ids, traces_list, sample_coords = [], [], None
+        for pd_obj in plot_data_list:
+            if not pd_obj.has_data or not pd_obj.is_enabled:
+                continue
+            if len(pd_obj.samples) == 0:
+                continue
+            si = int(np.searchsorted(pd_obj.samples, sample_min))
+            ei = int(np.searchsorted(pd_obj.samples, sample_max, side='right'))
+            si, ei = max(0, si), min(len(pd_obj.samples), ei)
+            if ei <= si:
+                continue
+            det_ids.append(pd_obj.detector_id)
+            traces_list.append(pd_obj.values[si:ei])
+            s_slice = pd_obj.samples[si:ei]
+            if sample_coords is None or len(s_slice) > len(sample_coords):
+                sample_coords = s_slice
+
+        if not det_ids or sample_coords is None or len(sample_coords) == 0:
+            return
+
+        n_samples = len(sample_coords)
+        order = np.argsort(det_ids)
+        det_ids = [det_ids[i] for i in order]
+        grid = np.zeros((len(det_ids), n_samples))
+        for row, i in enumerate(order):
+            t = traces_list[i]
+            n = min(len(t), n_samples)
+            grid[row, :n] = t[:n]
+
+        vmin = float(grid.min())
+        vmax = float(grid.max()) if grid.max() > vmin else vmin + 1e-9
+
+        # ImageItem indexes as image[x, y], so transpose detector-major grid
+        self.img_item.setImage(grid.T, autoLevels=False, levels=(vmin, vmax))
+        self.img_item.setRect(QRectF(float(sample_coords[0]), -0.5,
+                                     float(sample_coords[-1] - sample_coords[0]),
+                                     len(det_ids)))
+
+        axis = self.getPlotItem().getAxis('left')
+        axis.setTicks([[(i, str(det)) for i, det in enumerate(det_ids)]])
+
+        self.setXRange(float(sample_coords[0]), float(sample_coords[-1]), padding=0.02)
+        self.setYRange(-0.5, len(det_ids) - 0.5, padding=0.02)
+
+
+# ---------------------------------------------------------------------------
 # AngularHeatmapCanvas
 # ---------------------------------------------------------------------------
 

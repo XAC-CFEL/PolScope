@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout,
                               QTableWidget, QTableWidgetItem, QHeaderView,
                               QComboBox, QRadioButton, QButtonGroup, QMessageBox,
                               QDialog, QListWidget, QListWidgetItem,
-                              QColorDialog, QLineEdit)
+                              QColorDialog, QLineEdit, QStackedWidget)
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot
 from PyQt6.QtGui import QFont, QColor
 
@@ -38,7 +38,8 @@ class _NoScrollSpinBox(QSpinBox):
 class _NoScrollDoubleSpinBox(QDoubleSpinBox):
     def wheelEvent(self, event):
         event.ignore()
-from plotting import FastMplCanvas, PolarPlotCanvas, AngularHeatmapCanvas, SingleDetectorCanvas, HistoryCanvas
+from plotting import (FastMplCanvas, PolarPlotCanvas, CartesianHeightCanvas,
+                      AngularHeatmapCanvas, SingleDetectorCanvas, HistoryCanvas)
 from history import HistoryBuffer
 
 
@@ -246,11 +247,15 @@ class MainWindow(QMainWindow):
 
         self.tab_widget.addTab(self.polar_widget, "Polarization")
 
-        # Tab 4: Angular Heatmap + its settings
+        # Tab 4: Heatmap (angular / Cartesian) + its settings
         self.heatmap_widget = QWidget()
         heatmap_outer_layout = QHBoxLayout(self.heatmap_widget)
         self.heatmap_canvas = AngularHeatmapCanvas(self, width=7, height=7, dpi=100)
-        heatmap_outer_layout.addWidget(self.heatmap_canvas, stretch=3)
+        self.heatmap_cartesian_canvas = CartesianHeightCanvas(self, width=7, height=7, dpi=100)
+        self.heatmap_canvas_stack = QStackedWidget()
+        self.heatmap_canvas_stack.addWidget(self.heatmap_canvas)            # index 0
+        self.heatmap_canvas_stack.addWidget(self.heatmap_cartesian_canvas)  # index 1
+        heatmap_outer_layout.addWidget(self.heatmap_canvas_stack, stretch=3)
 
         heatmap_settings_outer = QWidget()
         heatmap_settings_outer.setMinimumWidth(210)
@@ -261,7 +266,7 @@ class MainWindow(QMainWindow):
         heatmap_settings_outer_layout.addStretch()
         heatmap_outer_layout.addWidget(heatmap_settings_outer, stretch=0)
 
-        self.tab_widget.addTab(self.heatmap_widget, "Angular Heatmap")
+        self.tab_widget.addTab(self.heatmap_widget, "Heatmap")
 
         # Tab 4: Single Detector (interactive zoom/pan)
         self.single_det_widget = QWidget()
@@ -378,7 +383,7 @@ class MainWindow(QMainWindow):
         self.results_need_update = False  # Flag to track if results need updating
         self.plots_need_update = False    # Flag for detector plots
         self.polar_needs_update = False   # Flag for polar plot updates
-        self.heatmap_needs_update = False  # Flag for angular heatmap updates
+        self.heatmap_needs_update = False  # Flag for heatmap updates
         self.single_det_needs_update = False  # Flag for single detector plot
         self.history_needs_update = False  # Flag for history plot
 
@@ -828,11 +833,17 @@ class MainWindow(QMainWindow):
         return polar_group
 
     def create_heatmap_settings_group(self):
-        """Angular heatmap parameters (shown on the Angular Heatmap tab)."""
-        heatmap_group = QGroupBox("Angular Heatmap Settings")
+        """Heatmap parameters (shown on the Heatmap tab)."""
+        heatmap_group = QGroupBox("Heatmap Settings")
         heatmap_layout = QGridLayout()
 
         row = 0
+        self.heatmap_cartesian_check = QCheckBox("Cartesian View")
+        self.heatmap_cartesian_check.setChecked(False)
+        self.heatmap_cartesian_check.stateChanged.connect(self._on_heatmap_view_mode_changed)
+        heatmap_layout.addWidget(self.heatmap_cartesian_check, row, 0, 1, 2)
+
+        row += 1
         heatmap_layout.addWidget(QLabel("Sample Min:"), row, 0)
         self.heatmap_smin_spin = _NoScrollSpinBox()
         self.heatmap_smin_spin.setRange(0, 10000)
@@ -1472,7 +1483,7 @@ class MainWindow(QMainWindow):
         self.record_history()
 
         # Update heatmap if it's visible or flag for update
-        if self.tab_widget.currentIndex() == 3:  # Angular Heatmap tab
+        if self.tab_widget.currentIndex() == 3:  # Heatmap tab
             self.update_heatmap_plot()
         else:
             self.heatmap_needs_update = True
@@ -1508,7 +1519,7 @@ class MainWindow(QMainWindow):
             self.polar_canvas.last_fit_params = None
             self.update_polar_plot()
             self.polar_needs_update = False
-        elif index == 3 and self.heatmap_needs_update:  # Angular Heatmap tab
+        elif index == 3 and self.heatmap_needs_update:  # Heatmap tab
             self.update_heatmap_plot()
             self.heatmap_needs_update = False
         elif index == 4 and self.single_det_needs_update:  # Single Detector tab
@@ -1562,19 +1573,31 @@ class MainWindow(QMainWindow):
         if self.tab_widget.currentIndex() == 3:
             self.update_heatmap_plot()
 
+    def _on_heatmap_view_mode_changed(self, state):
+        """Switch the Heatmap tab between angular and Cartesian views"""
+        self.heatmap_canvas_stack.setCurrentIndex(1 if bool(state) else 0)
+        self.on_heatmap_param_changed()
+
     def update_heatmap_plot(self):
-        """Rebuild the angular heatmap with current plot data and results"""
+        """Rebuild the heatmap with current plot data and results"""
         if self.last_plot_data is None:
             return
-        self.heatmap_canvas.update_heatmap(
-            self.last_plot_data,
-            self.last_results_df,
-            sample_min=self.heatmap_smin_spin.value(),
-            sample_max=self.heatmap_smax_spin.value(),
-            interpolate=self.heatmap_interpolate_check.isChecked(),
-            show_peaks=self.heatmap_showpeaks_check.isChecked(),
-            resolution=self.heatmap_res_spin.value(),
-        )
+        if self.heatmap_cartesian_check.isChecked():
+            self.heatmap_cartesian_canvas.update_cartesian_heatmap(
+                self.last_plot_data,
+                sample_min=self.heatmap_smin_spin.value(),
+                sample_max=self.heatmap_smax_spin.value(),
+            )
+        else:
+            self.heatmap_canvas.update_heatmap(
+                self.last_plot_data,
+                self.last_results_df,
+                sample_min=self.heatmap_smin_spin.value(),
+                sample_max=self.heatmap_smax_spin.value(),
+                interpolate=self.heatmap_interpolate_check.isChecked(),
+                show_peaks=self.heatmap_showpeaks_check.isChecked(),
+                resolution=self.heatmap_res_spin.value(),
+            )
 
     def update_single_detector_plot(self, plot_data_list):
         """Update the single detector canvas with the currently selected detector"""
