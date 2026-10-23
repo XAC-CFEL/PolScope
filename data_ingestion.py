@@ -41,7 +41,6 @@ def _convert_train_event(train_event, addresses: list, baseline_region=None, shi
         if readout is None or readout.data is None:
             raise ValueError(f"No data for address '{addr}' (detector {i})")
         arr = np.asarray(readout.data, dtype=np.float64)
-        print(f"Readout array for address '{addr}' (detector {i}): {arr.shape}")
         if arr.ndim == 1:
             arr = arr[np.newaxis, :]   # (1, n_samples)
         if n_pulses is None:
