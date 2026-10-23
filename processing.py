@@ -19,6 +19,19 @@ def process_detector_chunk(args):
     try:
         # detector_data is passed directly (xarray DataArrays are picklable)
         # Note: Data is already normalized AND ROI-applied before chunking
+        # Live trains may carry fewer pulses than the requested stack range; an out-of-range
+        # pulse selects nothing and makes groupby("trainId") fail with "must not be empty".
+        n_pulses = len(np.unique(detector_data.indexes['pulse'].get_level_values('pulseId')))
+        config = dict(config)
+        start = config.get('pulseStackStart')
+        stop = config.get('pulseStackStop')
+        if start is not None and start >= n_pulses:
+            start = 0
+        if stop is not None:
+            stop = min(stop, n_pulses)
+        config['pulseStackStart'] = start
+        config['pulseStackStop'] = stop
+
         pf = PeakFinder(detector_data, config=config)
         # stack() averages across trains/pulses based on config
         pf.stack()
