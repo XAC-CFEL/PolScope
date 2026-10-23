@@ -844,6 +844,14 @@ class MainWindow(QMainWindow):
         heatmap_layout.addWidget(self.heatmap_cartesian_check, row, 0, 1, 2)
 
         row += 1
+        self.heatmap_angle_axis_check = QCheckBox("Angle on Y axis (Cartesian)")
+        self.heatmap_angle_axis_check.setChecked(False)
+        self.heatmap_angle_axis_check.setToolTip(
+            "Cartesian view: use detector angle (0-360\u00b0) instead of detector number")
+        self.heatmap_angle_axis_check.stateChanged.connect(self.on_heatmap_param_changed)
+        heatmap_layout.addWidget(self.heatmap_angle_axis_check, row, 0, 1, 2)
+
+        row += 1
         heatmap_layout.addWidget(QLabel("Sample Min:"), row, 0)
         self.heatmap_smin_spin = _NoScrollSpinBox()
         self.heatmap_smin_spin.setRange(0, 10000)
@@ -1092,6 +1100,7 @@ class MainWindow(QMainWindow):
                     angles_list = list(angles_cfg)
                 self.polar_canvas.set_angles(angles_list)
                 self.heatmap_canvas.set_angles(angles_list)
+                self.heatmap_cartesian_canvas.set_angles(angles_list)
 
         # Recreate canvas
         self.recreate_canvas()
@@ -1587,6 +1596,10 @@ class MainWindow(QMainWindow):
                 self.last_plot_data,
                 sample_min=self.heatmap_smin_spin.value(),
                 sample_max=self.heatmap_smax_spin.value(),
+                use_angle=self.heatmap_angle_axis_check.isChecked(),
+                interpolate=self.heatmap_interpolate_check.isChecked(),
+                results_df=self.last_results_df,
+                show_peaks=self.heatmap_showpeaks_check.isChecked(),
             )
         else:
             self.heatmap_canvas.update_heatmap(

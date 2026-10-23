@@ -713,9 +713,46 @@ class CartesianHeightCanvas(pg.PlotWidget):
         self.img_item.setColorMap(pg.colormap.get('viridis'))
         self.addItem(self.img_item)
 
+        self._peak_lines = pg.PlotDataItem([], [], pen=_pen(COLOR_FWHM, width=1.5),
+                                           connect='pairs')
+        self.addItem(self._peak_lines)
+        self._peak_scatter = pg.ScatterPlotItem(size=6, pen=None, brush=_brush(COLOR_PEAK))
+        self.addItem(self._peak_scatter)
+
+        nxs_config = GlobalConfig.get_for_class('NXSLoader')
+        self.angles_deg = np.array(
+            nxs_config.get('angles', np.linspace(0, 337.5, 16).tolist())
+            if nxs_config else np.linspace(0, 337.5, 16).tolist()
+        )
+
+    def set_angles(self, angles_deg):
+        self.angles_deg = np.array(angles_deg)
+
+    def _update_peaks(self, results_df, y_of_det: dict, sample_min: float, sample_max: float):
+        """Draw peak markers and FWHM segments at each detector's y position."""
+        px, py, sx, sy = [], [], [], []
+        if results_df is not None and not results_df.empty:
+            for det, pos, wl, wr in zip(results_df['detector'], results_df['pos'],
+                                        results_df['width left'], results_df['width right']):
+                y = y_of_det.get(int(det))
+                if y is None or not (sample_min <= pos <= sample_max):
+                    continue
+                px.append(float(pos))
+                py.append(y)
+                sx += [float(pos + wl), float(pos + wr)]
+                sy += [y, y]
+        self._peak_lines.setData(np.asarray(sx), np.asarray(sy))
+        self._peak_scatter.setData(x=np.asarray(px), y=np.asarray(py))
+
     def update_cartesian_heatmap(self, plot_data_list: List['PlotData'],
-                                 sample_min: int, sample_max: int):
+                                 sample_min: int, sample_max: int,
+                                 use_angle: bool = False,
+                                 interpolate: bool = True,
+                                 results_df=None,
+                                 show_peaks: bool = True):
         self.img_item.clear()
+        self._update_peaks(None, {}, sample_min, sample_max)
+        self.getPlotItem().setLabel('left', 'Angle (\u00b0)' if use_angle else 'Detector')
 
         det_ids, traces_list, sample_coords = [], [], None
         for pd_obj in plot_data_list:
@@ -738,6 +775,44 @@ class CartesianHeightCanvas(pg.PlotWidget):
             return
 
         n_samples = len(sample_coords)
+
+        if use_angle:
+            valid = [k for k, d in enumerate(det_ids) if d < len(self.angles_deg)]
+            if not valid:
+                return
+            traces = np.zeros((len(valid), n_samples))
+            for row, k in enumerate(valid):
+                t = traces_list[k]
+                n = min(len(t), n_samples)
+                traces[row, :n] = t[:n]
+            angles_rad = np.deg2rad(self.angles_deg[[det_ids[k] for k in valid]]) % (2 * np.pi)
+
+            n_theta = 720
+            if interpolate:
+                img, _ = AngularHeatmapCanvas._build_intensity_grid(
+                    traces, angles_rad, n_theta=n_theta)
+            else:
+                # nearest detector by circular angular distance
+                theta_grid = np.linspace(0, 2 * np.pi, n_theta, endpoint=False)
+                diff = np.abs(theta_grid[:, None] - angles_rad[None, :])
+                diff = np.minimum(diff, 2 * np.pi - diff)
+                img = traces[np.argmin(diff, axis=1)]
+
+            vmin = float(img.min())
+            vmax = float(img.max()) if img.max() > vmin else vmin + 1e-9
+            self.img_item.setImage(img.T, autoLevels=False, levels=(vmin, vmax))
+            self.img_item.setRect(QRectF(float(sample_coords[0]), 0.0,
+                                         float(sample_coords[-1] - sample_coords[0]),
+                                         360.0))
+            self.getPlotItem().getAxis('left').setTicks(None)
+            self.setXRange(float(sample_coords[0]), float(sample_coords[-1]), padding=0.02)
+            self.setYRange(0.0, 360.0, padding=0.02)
+            if show_peaks:
+                y_of_det = {det_ids[k]: float(self.angles_deg[det_ids[k]]) % 360.0
+                            for k in valid}
+                self._update_peaks(results_df, y_of_det, sample_min, sample_max)
+            return
+
         order = np.argsort(det_ids)
         det_ids = [det_ids[i] for i in order]
         grid = np.zeros((len(det_ids), n_samples))
@@ -745,6 +820,15 @@ class CartesianHeightCanvas(pg.PlotWidget):
             t = traces_list[i]
             n = min(len(t), n_samples)
             grid[row, :n] = t[:n]
+
+        n_det = len(det_ids)
+        if interpolate and n_det > 1:
+            # linear interpolation between neighbouring detector rows (row centres at integer y)
+            k = 16
+            y = np.clip((np.arange(n_det * k) + 0.5) / k - 0.5, 0, n_det - 1)
+            lo = np.minimum(y.astype(int), n_det - 2)
+            w = (y - lo)[:, np.newaxis]
+            grid = grid[lo] * (1.0 - w) + grid[lo + 1] * w
 
         vmin = float(grid.min())
         vmax = float(grid.max()) if grid.max() > vmin else vmin + 1e-9
@@ -760,6 +844,9 @@ class CartesianHeightCanvas(pg.PlotWidget):
 
         self.setXRange(float(sample_coords[0]), float(sample_coords[-1]), padding=0.02)
         self.setYRange(-0.5, len(det_ids) - 0.5, padding=0.02)
+        if show_peaks:
+            self._update_peaks(results_df, {d: float(i) for i, d in enumerate(det_ids)},
+                               sample_min, sample_max)
 
 
 # ---------------------------------------------------------------------------
@@ -803,6 +890,9 @@ class AngularHeatmapCanvas(pg.GraphicsLayoutWidget):
         self.plot.addItem(self._peak_lines)
         self._peak_scatter = pg.ScatterPlotItem(size=6, pen=None, brush=_brush('#ff0000'))
         self.plot.addItem(self._peak_scatter)
+        # image/wedges are added later; keep the overlay above them
+        self._peak_lines.setZValue(10)
+        self._peak_scatter.setZValue(11)
 
     def set_angles(self, angles_deg):
         self.angles_deg = np.array(angles_deg)
@@ -976,6 +1066,8 @@ class AngularHeatmapCanvas(pg.GraphicsLayoutWidget):
         for item in self._peak_items:
             self.plot.removeItem(item)
         self._peak_items.clear()
+        self._peak_lines.setVisible(False)
+        self._peak_scatter.setVisible(False)
 
         # Collect enabled detectors
         det_ids, traces_list, sample_coords = [], [], None
@@ -1059,12 +1151,15 @@ class AngularHeatmapCanvas(pg.GraphicsLayoutWidget):
         # Peak overlay (persistent items, updated in place)
         if show_peaks and results_df is not None and not results_df.empty:
             seg_x, seg_y, px_list, py_list = [], [], [], []
+            shown = set(det_ids)
             for _, row in results_df.iterrows():
                 det = int(row['detector'])
-                if det >= len(self.angles_rad):
+                if det not in shown:
                     continue
                 ang = self.angles_rad[det]
                 pos = float(row['pos'])
+                if not (rmin_abs <= pos <= rmax_abs):
+                    continue
                 wl_p = float(row['width left'])
                 wr_p = float(row['width right'])
                 p_d = float(np.clip(rmap(pos), 0.0, rmax_abs))
@@ -1074,10 +1169,10 @@ class AngularHeatmapCanvas(pg.GraphicsLayoutWidget):
                 py_list.append(p_d * np.sin(ang))
                 seg_x += [(p_d + wl_d) * np.cos(ang), (p_d + wr_d) * np.cos(ang)]
                 seg_y += [(p_d + wl_d) * np.sin(ang), (p_d + wr_d) * np.sin(ang)]
-            self._peak_lines.setData(seg_x, seg_y)
-            self._peak_lines.setVisible(True)
+            self._peak_lines.setData(np.asarray(seg_x), np.asarray(seg_y))
+            self._peak_lines.setVisible(bool(seg_x))
             if px_list:
-                self._peak_scatter.setData(x=px_list, y=py_list)
+                self._peak_scatter.setData(x=np.asarray(px_list), y=np.asarray(py_list))
                 self._peak_scatter.setVisible(True)
             else:
                 self._peak_scatter.setVisible(False)
