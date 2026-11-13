@@ -844,7 +844,7 @@ class MainWindow(QMainWindow):
         heatmap_layout.addWidget(self.heatmap_cartesian_check, row, 0, 1, 2)
 
         row += 1
-        self.heatmap_angle_axis_check = QCheckBox("Angle on Y axis (Cartesian)")
+        self.heatmap_angle_axis_check = QCheckBox("Angle on X axis (Cartesian)")
         self.heatmap_angle_axis_check.setChecked(False)
         self.heatmap_angle_axis_check.setToolTip(
             "Cartesian view: use detector angle (0-360\u00b0) instead of detector number")

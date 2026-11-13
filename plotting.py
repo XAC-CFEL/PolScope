@@ -697,15 +697,15 @@ class PolarPlotCanvas(pg.PlotWidget):
 # ---------------------------------------------------------------------------
 
 class CartesianHeightCanvas(pg.PlotWidget):
-    """Cartesian alternative to the angular heatmap: detector (y) vs sample (x),
+    """Cartesian alternative to the angular heatmap: detector (x) vs sample (y),
     coloured by trace intensity."""
 
     def __init__(self, parent=None, width=6, height=6, dpi=100):
         super().__init__(parent=parent)
         self.setViewport(QWidget())  # force software rendering (no OpenGL)
         self.getPlotItem().setTitle('Heatmap (Cartesian)')
-        self.getPlotItem().setLabel('bottom', 'Sample')
-        self.getPlotItem().setLabel('left', 'Detector')
+        self.getPlotItem().setLabel('left', 'Sample')
+        self.getPlotItem().setLabel('bottom', 'Detector')
         self.getPlotItem().hideButtons()
         self.showGrid(x=False, y=False)
 
@@ -728,19 +728,19 @@ class CartesianHeightCanvas(pg.PlotWidget):
     def set_angles(self, angles_deg):
         self.angles_deg = np.array(angles_deg)
 
-    def _update_peaks(self, results_df, y_of_det: dict, sample_min: float, sample_max: float):
-        """Draw peak markers and FWHM segments at each detector's y position."""
+    def _update_peaks(self, results_df, x_of_det: dict, sample_min: float, sample_max: float):
+        """Draw peak markers and FWHM segments at each detector's x position."""
         px, py, sx, sy = [], [], [], []
         if results_df is not None and not results_df.empty:
             for det, pos, wl, wr in zip(results_df['detector'], results_df['pos'],
                                         results_df['width left'], results_df['width right']):
-                y = y_of_det.get(int(det))
-                if y is None or not (sample_min <= pos <= sample_max):
+                x = x_of_det.get(int(det))
+                if x is None or not (sample_min <= pos <= sample_max):
                     continue
-                px.append(float(pos))
-                py.append(y)
-                sx += [float(pos + wl), float(pos + wr)]
-                sy += [y, y]
+                px.append(x)
+                py.append(float(pos))
+                sx += [x, x]
+                sy += [float(pos + wl), float(pos + wr)]
         self._peak_lines.setData(np.asarray(sx), np.asarray(sy))
         self._peak_scatter.setData(x=np.asarray(px), y=np.asarray(py))
 
@@ -752,7 +752,7 @@ class CartesianHeightCanvas(pg.PlotWidget):
                                  show_peaks: bool = True):
         self.img_item.clear()
         self._update_peaks(None, {}, sample_min, sample_max)
-        self.getPlotItem().setLabel('left', 'Angle (\u00b0)' if use_angle else 'Detector')
+        self.getPlotItem().setLabel('bottom', 'Angle (\u00b0)' if use_angle else 'Detector')
 
         det_ids, traces_list, sample_coords = [], [], None
         for pd_obj in plot_data_list:
@@ -800,17 +800,17 @@ class CartesianHeightCanvas(pg.PlotWidget):
 
             vmin = float(img.min())
             vmax = float(img.max()) if img.max() > vmin else vmin + 1e-9
-            self.img_item.setImage(img.T, autoLevels=False, levels=(vmin, vmax))
-            self.img_item.setRect(QRectF(float(sample_coords[0]), 0.0,
-                                         float(sample_coords[-1] - sample_coords[0]),
-                                         360.0))
-            self.getPlotItem().getAxis('left').setTicks(None)
-            self.setXRange(float(sample_coords[0]), float(sample_coords[-1]), padding=0.02)
-            self.setYRange(0.0, 360.0, padding=0.02)
+            self.img_item.setImage(img, autoLevels=False, levels=(vmin, vmax))
+            self.img_item.setRect(QRectF(0.0, float(sample_coords[0]),
+                                         360.0,
+                                         float(sample_coords[-1] - sample_coords[0])))
+            self.getPlotItem().getAxis('bottom').setTicks(None)
+            self.setXRange(0.0, 360.0, padding=0.02)
+            self.setYRange(float(sample_coords[0]), float(sample_coords[-1]), padding=0.02)
             if show_peaks:
-                y_of_det = {det_ids[k]: float(self.angles_deg[det_ids[k]]) % 360.0
+                x_of_det = {det_ids[k]: float(self.angles_deg[det_ids[k]]) % 360.0
                             for k in valid}
-                self._update_peaks(results_df, y_of_det, sample_min, sample_max)
+                self._update_peaks(results_df, x_of_det, sample_min, sample_max)
             return
 
         order = np.argsort(det_ids)
@@ -823,7 +823,7 @@ class CartesianHeightCanvas(pg.PlotWidget):
 
         n_det = len(det_ids)
         if interpolate and n_det > 1:
-            # linear interpolation between neighbouring detector rows (row centres at integer y)
+            # linear interpolation between neighbouring detector rows (row centres at integer x)
             k = 16
             y = np.clip((np.arange(n_det * k) + 0.5) / k - 0.5, 0, n_det - 1)
             lo = np.minimum(y.astype(int), n_det - 2)
@@ -833,17 +833,17 @@ class CartesianHeightCanvas(pg.PlotWidget):
         vmin = float(grid.min())
         vmax = float(grid.max()) if grid.max() > vmin else vmin + 1e-9
 
-        # ImageItem indexes as image[x, y], so transpose detector-major grid
-        self.img_item.setImage(grid.T, autoLevels=False, levels=(vmin, vmax))
-        self.img_item.setRect(QRectF(float(sample_coords[0]), -0.5,
-                                     float(sample_coords[-1] - sample_coords[0]),
-                                     len(det_ids)))
+        # ImageItem indexes as image[x, y]: detector-major grid -> detector on x, sample on y
+        self.img_item.setImage(grid, autoLevels=False, levels=(vmin, vmax))
+        self.img_item.setRect(QRectF(-0.5, float(sample_coords[0]),
+                                     len(det_ids),
+                                     float(sample_coords[-1] - sample_coords[0])))
 
-        axis = self.getPlotItem().getAxis('left')
+        axis = self.getPlotItem().getAxis('bottom')
         axis.setTicks([[(i, str(det)) for i, det in enumerate(det_ids)]])
 
-        self.setXRange(float(sample_coords[0]), float(sample_coords[-1]), padding=0.02)
-        self.setYRange(-0.5, len(det_ids) - 0.5, padding=0.02)
+        self.setXRange(-0.5, len(det_ids) - 0.5, padding=0.02)
+        self.setYRange(float(sample_coords[0]), float(sample_coords[-1]), padding=0.02)
         if show_peaks:
             self._update_peaks(results_df, {d: float(i) for i, d in enumerate(det_ids)},
                                sample_min, sample_max)
